@@ -1,0 +1,24 @@
+# OS
+.DS_Store
+
+# Virtual environment
+.venv/
+
+# Claude Code
+.claude/
+
+# Data & model directories
+downloads/
+mlx_models/
+transcripts/
+
+# Environment
+.env
+.env.*
+
+# Python
+__pycache__/
+*.pyc
+
+# Logs
+*.log
