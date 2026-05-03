@@ -1,3 +1,4 @@
 feedparser
 requests
 lightning-whisper-mlx
+tomli; python_version < "3.11"

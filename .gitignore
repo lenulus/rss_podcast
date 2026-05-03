@@ -15,6 +15,7 @@ transcripts/
 # Environment
 .env
 .env.*
+feeds.toml
 
 # Python
 __pycache__/

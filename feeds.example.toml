@@ -1,0 +1,39 @@
+# Copy to feeds.toml and fill in your private RSS URLs.
+# Each [feeds.<tag>] block defines a feed. The tag is used as the
+# subfolder name under ./downloads/<tag>/ and ./transcripts/<tag>/.
+
+[feeds.nates-notebook]
+rss = "https://api.substack.com/feed/podcast/XXXXXX/private-key.rss"
+
+# ── Optional per-feed settings ───────────────────────────────────────────────
+
+# substack.sid cookie for paywalled transcripts.
+# sid = "..."
+
+# Cap the number of mp3s kept locally in ./downloads/<tag>/.
+# Eviction runs after --download and --transcribe. Oldest mp3s go first,
+# but only mp3s that already have a transcript are eligible — the source
+# audio is never deleted unless its transcript exists.
+# max_episodes_on_disk = 20
+
+# When evicting, copy the mp3 here first (e.g. an SD card mountpoint),
+# then delete from ./downloads/<tag>/. If the path (or its parent) does
+# not exist — say, the SD card isn't mounted — eviction is skipped
+# entirely rather than risking unbacked deletion.
+# Backups land at <backup_path>/<tag>/<file>.mp3.
+# backup_path = "/Volumes/PodcastSD/archive"
+
+# Default cap for --download / fetch in a single run. Useful for
+# backfilling a new feed gradually instead of pulling 300 episodes at once.
+# Overridden by an explicit --limit on the CLI.
+# max_downloads_per_run = 5
+
+# Order to walk feed entries when downloading. Default: "newest".
+# Use "oldest" for incremental backfill of an archive.
+# download_order = "newest"   # or "oldest"
+
+# [feeds.another-feed]
+# rss = "https://api.substack.com/feed/podcast/YYYYYY/private-key.rss"
+# max_episodes_on_disk = 10
+# max_downloads_per_run = 3
+# download_order = "oldest"
