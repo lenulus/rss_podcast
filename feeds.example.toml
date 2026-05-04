@@ -1,6 +1,18 @@
 # Copy to feeds.toml and fill in your private RSS URLs.
 # Each [feeds.<tag>] block defines a feed. The tag is used as the
 # subfolder name under ./downloads/<tag>/ and ./transcripts/<tag>/.
+#
+# Backups (when configured) land at:
+#   <backup_path>/<tag>/media/<file>.mp3   — copied during eviction
+#   <backup_path>/<tag>/text/<file>.md     — copied on every operation,
+#                                            never deleted from local
+# Override either path with media_dir / transcript_dir at the feed level.
+
+# ── Defaults applied to every feed (per-feed values override) ────────────────
+[defaults]
+# backup_path = "/Volumes/PodcastSD/archive"
+
+# ── Feeds ────────────────────────────────────────────────────────────────────
 
 [feeds.nates-notebook]
 rss = "https://api.substack.com/feed/podcast/XXXXXX/private-key.rss"
@@ -16,12 +28,13 @@ rss = "https://api.substack.com/feed/podcast/XXXXXX/private-key.rss"
 # audio is never deleted unless its transcript exists.
 # max_episodes_on_disk = 20
 
-# When evicting, copy the mp3 here first (e.g. an SD card mountpoint),
-# then delete from ./downloads/<tag>/. If the path (or its parent) does
-# not exist — say, the SD card isn't mounted — eviction is skipped
-# entirely rather than risking unbacked deletion.
-# Backups land at <backup_path>/<tag>/<file>.mp3.
-# backup_path = "/Volumes/PodcastSD/archive"
+# Override [defaults].backup_path for just this feed.
+# backup_path = "/Volumes/OtherSD/archive"
+
+# Override the media or transcript path independently of backup_path.
+# Useful for split storage (e.g. mp3s on SD, transcripts in a cloud-synced dir).
+# media_dir = "/Volumes/Audio/nates-notebook"
+# transcript_dir = "/Users/me/Dropbox/transcripts/nates-notebook"
 
 # Default cap for --download / fetch in a single run. Useful for
 # backfilling a new feed gradually instead of pulling 300 episodes at once.

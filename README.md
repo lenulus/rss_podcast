@@ -21,29 +21,42 @@ cp feeds.example.toml feeds.toml   # then edit with your private RSS URL(s)
 
 ## Configuring feeds
 
-Each feed gets a tag, which is used as the subfolder name under `./downloads/<tag>/` and `./transcripts/<tag>/`:
+Each feed gets a tag, which is used as the subfolder name under `./downloads/<tag>/` and `./transcripts/<tag>/`. A `[defaults]` block applies to every feed; per-feed values override:
 
 ```toml
+[defaults]
+backup_path = "/Volumes/PodcastSD/archive"   # one SD card, all feeds
+
 [feeds.nates-notebook]
 rss = "https://api.substack.com/feed/podcast/XXXXXX/private-key.rss"
-# sid = "optional-substack.sid-cookie"
+max_episodes_on_disk = 10
+# Inherits backup_path from [defaults] → backups go to
+# /Volumes/PodcastSD/archive/nates-notebook/
 
 [feeds.new-show]
 rss = "https://api.substack.com/feed/podcast/YYYYYY/private-key.rss"
 max_episodes_on_disk = 20
 max_downloads_per_run = 5
 download_order = "oldest"
-backup_path = "/Volumes/PodcastSD/archive"
+backup_path = "/Volumes/OtherSD/archive"     # overrides default for this feed
+# media_dir = "/Volumes/Audio/new-show"      # overrides just the mp3 path
+# transcript_dir = "/Volumes/Cloud/new-show" # overrides just the transcript path
 ```
+
+Backups land at `<backup_path>/<tag>/media/` (mp3s) and `<backup_path>/<tag>/text/` (transcripts). Transcript backup runs on every `--download`, `--transcribe`, and `--fetch` — it's idempotent and never deletes from local. Mp3 eviction only happens when `max_episodes_on_disk` is set.
 
 ### Per-feed settings
 
+These can be set under `[defaults]` (applies to every feed) or under `[feeds.<tag>]` (overrides the default).
+
 | Key | Description |
 |-----|-------------|
-| `rss` | Private RSS feed URL (required) |
-| `sid` | `substack.sid` cookie for paywalled transcripts (optional) |
+| `rss` | Private RSS feed URL (required, per-feed only) |
+| `sid` | `substack.sid` cookie for paywalled transcripts |
 | `max_episodes_on_disk` | Cap mp3s kept in `./downloads/<tag>/`. Eviction runs after `--download` and `--transcribe`; oldest go first, but **only mp3s that already have a transcript are eligible** — source audio is never deleted unless its transcript exists. Transcripts themselves are never touched. |
-| `backup_path` | When evicting, copy the mp3 to `<backup_path>/<tag>/<file>.mp3` first, then delete locally. If the path (or its parent — e.g. an unmounted SD card mount point) is missing, eviction is **skipped entirely** rather than risking unbacked deletion. |
+| `backup_path` | Root for backups. Mp3s back up to `<backup_path>/<tag>/media/<file>.mp3`; transcripts back up to `<backup_path>/<tag>/text/<file>.md`. If the path (or its parent — e.g. an unmounted SD card mount point) is missing, the affected backup is **skipped entirely** rather than risking unbacked deletion. |
+| `media_dir` | Override where this feed's mp3 backups land. Absolute path. If set, replaces `<backup_path>/<tag>/media/`. |
+| `transcript_dir` | Override where this feed's transcript backups land. Absolute path. If set, replaces `<backup_path>/<tag>/text/`. |
 | `max_downloads_per_run` | Default cap for `--download` and the transcript-fetch path in a single run. Overridden by an explicit `--limit`. |
 | `download_order` | `"newest"` (default) or `"oldest"`. Use `"oldest"` for incremental backfill of an archive. |
 

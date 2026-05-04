@@ -42,6 +42,20 @@ def load_config(config_path: Path) -> dict:
         return tomllib.load(f)
 
 
+def feed_cfg_for(config: dict, tag: str | None) -> dict:
+    """Resolved config for a feed: [defaults] merged with per-feed overrides.
+
+    Returns {} if tag is missing or not in config.
+    """
+    if not tag:
+        return {}
+    feeds = config.get("feeds", {})
+    if tag not in feeds:
+        return {}
+    defaults = config.get("defaults", {}) or {}
+    return {**defaults, **(feeds[tag] or {})}
+
+
 def resolve_feed(args, config: dict) -> None:
     """If --feed <tag> was passed, populate rss/sid from config (CLI flags win)."""
     args._config = config
@@ -52,7 +66,7 @@ def resolve_feed(args, config: dict) -> None:
     if args.feed not in feeds:
         available = ", ".join(sorted(feeds.keys())) or "(none)"
         sys.exit(f"Feed '{args.feed}' not found in {args.config}. Available: {available}")
-    cfg = feeds[args.feed]
+    cfg = feed_cfg_for(config, args.feed)
     args._feed_cfg = cfg
     if not args.rss:
         args.rss = cfg.get("rss")
@@ -60,13 +74,6 @@ def resolve_feed(args, config: dict) -> None:
         args.sid = cfg.get("sid")
     if not args.rss:
         sys.exit(f"Feed '{args.feed}' in {args.config} has no 'rss' field.")
-
-
-def feed_cfg_for(config: dict, tag: str | None) -> dict:
-    """Look up a feed's config by tag — returns {} if tag missing or not in config."""
-    if not tag:
-        return {}
-    return config.get("feeds", {}).get(tag, {}) or {}
 
 
 def effective_limit(args) -> int | None:
@@ -234,6 +241,81 @@ def default_dir(kind: str, tag: str | None) -> Path:
     return Path(f"./{kind}{suffix}")
 
 
+# ── Backup paths ──────────────────────────────────────────────────────────────
+
+def _ensure_backup_dir(target: Path, tag: str, label: str) -> Path | None:
+    """Make sure a backup directory is reachable. Returns the dir or None on failure.
+
+    'Reachable' means the directory or its parent exists — protects against
+    silently writing into a path whose mountpoint (e.g. SD card) is gone.
+    """
+    if not target.exists() and not target.parent.is_dir():
+        print(f"  ⚠ [{tag}] {label} path {target} unavailable (parent missing) — skipping.")
+        return None
+    try:
+        target.mkdir(parents=True, exist_ok=True)
+    except OSError as e:
+        print(f"  ⚠ [{tag}] cannot create {label} dir {target}: {e} — skipping.")
+        return None
+    return target
+
+
+def resolve_media_dir(tag: str, feed_cfg: dict) -> Path | None:
+    """Where evicted mp3s back up to. Returns None if no backup is configured."""
+    explicit = feed_cfg.get("media_dir")
+    if explicit:
+        return _ensure_backup_dir(Path(explicit), tag, "media_dir")
+    backup_path = feed_cfg.get("backup_path")
+    if not backup_path:
+        return None
+    return _ensure_backup_dir(Path(backup_path) / tag / "media", tag, "media")
+
+
+def resolve_transcript_dir(tag: str, feed_cfg: dict) -> Path | None:
+    """Where transcript backups land. Returns None if no backup is configured."""
+    explicit = feed_cfg.get("transcript_dir")
+    if explicit:
+        return _ensure_backup_dir(Path(explicit), tag, "transcript_dir")
+    backup_path = feed_cfg.get("backup_path")
+    if not backup_path:
+        return None
+    return _ensure_backup_dir(Path(backup_path) / tag / "text", tag, "text")
+
+
+# ── Transcript backup ─────────────────────────────────────────────────────────
+
+def backup_feed_transcripts(tag: str, feed_cfg: dict) -> None:
+    """Sync ./transcripts/<tag>/*.md to the feed's text dir if configured.
+
+    Idempotent: skips files already present at the target. Never deletes from
+    the local source — transcripts stay locally for grep/wiki work.
+    """
+    src = Path(f"./transcripts/{tag}")
+    if not src.is_dir():
+        return
+    md_files = sorted(src.glob("*.md"))
+    if not md_files:
+        return
+
+    text_dir = resolve_transcript_dir(tag, feed_cfg)
+    if text_dir is None:
+        return
+
+    copied = 0
+    for md in md_files:
+        dest = text_dir / md.name
+        if dest.exists():
+            continue
+        try:
+            shutil.copy2(md, dest)
+            copied += 1
+        except OSError as e:
+            print(f"  ✗ [{tag}] transcript backup failed for {md.name}: {e}")
+
+    if copied:
+        print(f"  [{tag}] Backed up {copied} new transcript(s) → {text_dir}")
+
+
 # ── Eviction ──────────────────────────────────────────────────────────────────
 
 def prune_feed_mp3s(tag: str, feed_cfg: dict) -> None:
@@ -243,9 +325,9 @@ def prune_feed_mp3s(tag: str, feed_cfg: dict) -> None:
     - Keeps the newest N mp3s (by filename's YYYY-MM-DD prefix).
     - Only evicts mp3s that already have a matching transcript — never deletes
       source audio that hasn't been preserved.
-    - If backup_path is set, copy to <backup_path>/<tag>/<file>.mp3 first.
-      Skips eviction entirely if the backup path's parent directory is missing
-      (e.g. the SD card isn't mounted) — safer than silent deletion.
+    - If a media_dir is configured (explicit or derived from backup_path),
+      copy each mp3 there before deleting locally. If the path is unreachable
+      (e.g. SD card not mounted), eviction is skipped entirely.
     """
     cap = feed_cfg.get("max_episodes_on_disk")
     if not cap:
@@ -278,20 +360,13 @@ def prune_feed_mp3s(tag: str, feed_cfg: dict) -> None:
     if not evictable:
         return
 
-    backup_path = feed_cfg.get("backup_path")
+    # Resolve media_dir only if backup config exists. If user opted out
+    # (no media_dir, no backup_path), eviction still happens — locally only.
     backup_dir: Path | None = None
-    if backup_path:
-        bp = Path(backup_path)
-        # If neither the path nor its parent exists, the volume is likely unmounted.
-        if not bp.exists() and not bp.parent.is_dir():
-            print(f"  ⚠ [{tag}] backup_path {bp} unavailable (parent missing) — skipping eviction.")
-            return
-        backup_dir = bp / tag
-        try:
-            backup_dir.mkdir(parents=True, exist_ok=True)
-        except OSError as e:
-            print(f"  ⚠ [{tag}] cannot create backup dir {backup_dir}: {e} — skipping eviction.")
-            return
+    if feed_cfg.get("media_dir") or feed_cfg.get("backup_path"):
+        backup_dir = resolve_media_dir(tag, feed_cfg)
+        if backup_dir is None:
+            return  # path unavailable — _ensure_backup_dir already warned.
 
     print(f"  [{tag}] Pruning {len(evictable)} mp3(s) (cap {cap}, current {len(mp3s_old_to_new)}):")
     for mp3 in evictable:
@@ -381,6 +456,7 @@ def run_download(feed, args):
     print(f"\nDone. {fetched} new mp3(s) downloaded.")
 
     if args.feed:
+        backup_feed_transcripts(args.feed, args._feed_cfg)
         prune_feed_mp3s(args.feed, args._feed_cfg)
 
 
@@ -439,6 +515,9 @@ def run_fetch(feed, args):
 
     print(f"\nDone. {fetched} new transcript(s) fetched.")
 
+    if args.feed:
+        backup_feed_transcripts(args.feed, args._feed_cfg)
+
 
 def transcribe_pairs(args) -> list[tuple[Path, Path]]:
     """Determine (mp3_dir, transcript_dir) pairs to process based on args."""
@@ -477,9 +556,22 @@ def run_transcribe(args):
         plan.append((mp3_dir, out_dir, to_process))
         print(f"  {mp3_dir}: {len(mp3s)} mp3(s), {len(existing)} transcribed, {len(to_process)} pending → {out_dir}")
 
+    config = getattr(args, "_config", {}) or {}
+
+    def post_process(mp3_dir: Path):
+        """Run transcript backup + mp3 pruning for a finished feed dir."""
+        tag = mp3_dir.name
+        cfg = feed_cfg_for(config, tag)
+        if not cfg:
+            return
+        backup_feed_transcripts(tag, cfg)
+        prune_feed_mp3s(tag, cfg)
+
     total_pending = sum(len(p[2]) for p in plan)
     if total_pending == 0:
-        print("\nAll mp3s already have transcripts. Nothing to do.")
+        print("\nAll mp3s already have transcripts.")
+        for mp3_dir, _, _ in plan:
+            post_process(mp3_dir)
         return
 
     print(f"\nDevice: Apple Silicon GPU (MLX)")
@@ -488,18 +580,10 @@ def run_transcribe(args):
     whisper = LightningWhisperMLX(model=args.model, batch_size=12, quant=None)
 
     total_done = 0
-    config = getattr(args, "_config", {}) or {}
-
-    def prune_dir(mp3_dir: Path):
-        """Prune a finished feed dir if its tag matches a config entry."""
-        tag = mp3_dir.name
-        cfg = feed_cfg_for(config, tag)
-        if cfg:
-            prune_feed_mp3s(tag, cfg)
 
     for mp3_dir, out_dir, to_process in plan:
         if not to_process:
-            prune_dir(mp3_dir)
+            post_process(mp3_dir)
             continue
         out_dir.mkdir(parents=True, exist_ok=True)
         print(f"\n[{mp3_dir}] {len(to_process)} mp3(s) → {out_dir}")
@@ -507,7 +591,7 @@ def run_transcribe(args):
         for i, mp3_path in enumerate(to_process, 1):
             if args.limit and total_done >= args.limit:
                 print(f"\nLimit of {args.limit} reached.")
-                prune_dir(mp3_dir)
+                post_process(mp3_dir)
                 print(f"\nDone. {total_done} file(s) transcribed.")
                 return
 
@@ -533,7 +617,7 @@ def run_transcribe(args):
             print(f"    ✓ Saved: {out_path.name}")
             total_done += 1
 
-        prune_dir(mp3_dir)
+        post_process(mp3_dir)
 
     print(f"\nDone. {total_done} file(s) transcribed.")
 
