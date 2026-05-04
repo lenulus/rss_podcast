@@ -166,3 +166,15 @@ grep -rl "context engineering" ./transcripts/
 ## Output format
 
 Transcripts are saved as Markdown files named `YYYY-MM-DD - Episode Title.md` under `./transcripts/<feed-tag>/`. Downloaded mp3s use the same naming under `./downloads/<feed-tag>/`.
+
+## How dedup works (`.processed`)
+
+Each feed gets an append-only `./transcripts/<feed-tag>/.processed` file — one episode stem per line. This is the canonical "have we transcribed this?" record:
+
+- **`--download`, `--fetch`, `--transcribe`** consult `.processed` to skip episodes already handled — *not* the presence of `.md` files.
+- A successful transcript write appends to `.processed`. A failed transcription does not, so failures stay visible and re-runnable on the next pass.
+- On first run after this change, `.processed` is bootstrapped from existing `*.md` filenames automatically — no manual migration.
+
+What this enables: you can prune old transcript `.md` files locally without triggering re-downloads or re-transcription. The transcripts on the SD-card backup remain available for grep/restore; the index keeps the dedup intact.
+
+To force a re-transcribe of a specific episode, remove its line from `.processed`. To rebuild the index from scratch, delete `.processed` and run any command — it'll re-bootstrap from whatever `*.md` files are present.

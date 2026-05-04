@@ -241,6 +241,49 @@ def default_dir(kind: str, tag: str | None) -> Path:
     return Path(f"./{kind}{suffix}")
 
 
+# ── Processed index ───────────────────────────────────────────────────────────
+#
+# `./transcripts/<tag>/.processed` is the canonical "have we transcribed this?"
+# record. One episode stem per line. This decouples the dedup signal from the
+# transcript files themselves — so .md files can be pruned locally without
+# triggering re-downloads, while a failed transcription (which never appends
+# to the index) stays visible and re-runnable.
+
+def processed_index_path(tag: str) -> Path:
+    return Path(f"./transcripts/{tag}/.processed")
+
+
+def load_processed(tag: str) -> set[str]:
+    """Return the set of episode stems already transcribed for this feed.
+
+    If `.processed` doesn't exist yet, bootstrap it from any existing *.md
+    files in the feed's transcript directory.
+    """
+    index = processed_index_path(tag)
+    if index.exists():
+        return {
+            line.rstrip("\n")
+            for line in index.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        }
+
+    transcript_dir = Path(f"./transcripts/{tag}")
+    stems = sorted({p.stem for p in transcript_dir.glob("*.md")} if transcript_dir.is_dir() else set())
+    if stems:
+        transcript_dir.mkdir(parents=True, exist_ok=True)
+        index.write_text("\n".join(stems) + "\n", encoding="utf-8")
+        print(f"  [{tag}] Bootstrapped {index} from {len(stems)} existing transcript(s).")
+    return set(stems)
+
+
+def record_processed(tag: str, stem: str) -> None:
+    """Append a stem to the feed's .processed index (called after a write)."""
+    index = processed_index_path(tag)
+    index.parent.mkdir(parents=True, exist_ok=True)
+    with open(index, "a", encoding="utf-8") as f:
+        f.write(f"{stem}\n")
+
+
 # ── Backup paths ──────────────────────────────────────────────────────────────
 
 def _ensure_backup_dir(target: Path, tag: str, label: str) -> Path | None:
@@ -416,8 +459,12 @@ def run_download(feed, args):
 
     existing_mp3s = {p.stem for p in out_dir.glob("*.mp3")}
 
-    transcript_dir = Path(args.transcript_dir) if args.transcript_dir else default_dir("transcripts", args.feed)
-    existing_transcripts = {p.stem for p in transcript_dir.glob("*.md")} if transcript_dir.is_dir() else set()
+    if args.feed:
+        existing_transcripts = load_processed(args.feed)
+    else:
+        # No --feed → fall back to glob-based detection.
+        transcript_dir = Path(args.transcript_dir) if args.transcript_dir else default_dir("transcripts", args.feed)
+        existing_transcripts = {p.stem for p in transcript_dir.glob("*.md")} if transcript_dir.is_dir() else set()
     skip = existing_mp3s | existing_transcripts
 
     print(f"Output dir: {out_dir} ({len(existing_mp3s)} existing mp3(s), {len(existing_transcripts)} already transcribed)\n")
@@ -465,7 +512,10 @@ def run_fetch(feed, args):
     out_dir = Path(args.out) if args.out else default_dir("transcripts", args.feed)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    existing = {p.stem for p in out_dir.glob("*.md")}
+    if args.feed:
+        existing = load_processed(args.feed)
+    else:
+        existing = {p.stem for p in out_dir.glob("*.md")}
     print(f"Output dir: {out_dir} ({len(existing)} existing transcript(s))\n")
 
     limit = effective_limit(args)
@@ -508,6 +558,9 @@ def run_fetch(feed, args):
         write_markdown(out_path, title, pub_date, f"{base_url}/p/{slug}", text)
         print(f"    ✓ Saved: {out_path.name} ({len(text.split())} words)")
 
+        if args.feed:
+            record_processed(args.feed, stem)
+
         fetched += 1
         existing.add(stem)
 
@@ -543,6 +596,7 @@ def transcribe_pairs(args) -> list[tuple[Path, Path]]:
 def run_transcribe(args):
     """Transcribe mp3 files using Lightning Whisper MLX (Apple Silicon GPU)."""
     pairs = transcribe_pairs(args)
+    config = getattr(args, "_config", {}) or {}
 
     # Pre-scan to figure out how many files we'd process — lets us skip model load if zero.
     plan: list[tuple[Path, Path, list[Path]]] = []
@@ -551,12 +605,14 @@ def run_transcribe(args):
             print(f"  ↷ Skip {mp3_dir}: not a directory.")
             continue
         mp3s = sorted(mp3_dir.glob("*.mp3"))
-        existing = {p.stem for p in out_dir.glob("*.md")} if out_dir.is_dir() else set()
+        tag = mp3_dir.name
+        if feed_cfg_for(config, tag):
+            existing = load_processed(tag)
+        else:
+            existing = {p.stem for p in out_dir.glob("*.md")} if out_dir.is_dir() else set()
         to_process = [f for f in mp3s if f.stem not in existing]
         plan.append((mp3_dir, out_dir, to_process))
         print(f"  {mp3_dir}: {len(mp3s)} mp3(s), {len(existing)} transcribed, {len(to_process)} pending → {out_dir}")
-
-    config = getattr(args, "_config", {}) or {}
 
     def post_process(mp3_dir: Path):
         """Run transcript backup + mp3 pruning for a finished feed dir."""
@@ -615,6 +671,11 @@ def run_transcribe(args):
             out_path = out_dir / f"{mp3_path.stem}.md"
             out_path.write_text(f"# {mp3_path.stem}\n\n---\n\n{text}\n", encoding="utf-8")
             print(f"    ✓ Saved: {out_path.name}")
+
+            tag = mp3_dir.name
+            if feed_cfg_for(config, tag):
+                record_processed(tag, mp3_path.stem)
+
             total_done += 1
 
         post_process(mp3_dir)
