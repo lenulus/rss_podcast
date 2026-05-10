@@ -172,7 +172,10 @@ grep -rl "context engineering" ./transcripts/
 
 Transcripts are Markdown files named `YYYY-MM-DD - Episode Title.md` under `./transcripts/<feed-tag>/`. Downloaded mp3s use the same naming under `./downloads/<feed-tag>/`. Each transcript opens with YAML frontmatter (title, date, show, host, link, duration, guid) plus a visible header containing the episode's full RSS description and a Show notes link — see the [Episode metadata](#episode-metadata-in-transcripts) section. Diarized transcripts emit `**Speaker A** (mm:ss):` blocks per turn.
 
-Sidecars: `./downloads/<feed-tag>/<stem>.meta.json` (small, paired with the mp3, removed during eviction) and `./transcripts/<feed-tag>/.diarize/<stem>.json` (cached pyannote output, lets a retry skip the diarize pass).
+Sidecars:
+- `./downloads/<feed-tag>/<stem>.meta.json` — episode metadata captured at download (small, paired with the mp3, removed during eviction)
+- `./transcripts/<feed-tag>/.diarize/<stem>.json` — cached pyannote turns (lets a retry skip the ~40-min diarize pass on long files)
+- `./transcripts/<feed-tag>/.chunks/<stem>/chunk_NNN.json` — per-chunk Whisper output, written as each chunk completes. If transcribe crashes mid-file, a retry resumes from the last successful chunk. Cleaned up automatically once all chunks merge.
 
 ## Speaker diarization (optional)
 

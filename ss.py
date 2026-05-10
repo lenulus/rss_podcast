@@ -761,17 +761,25 @@ def save_diarization_cache(mp3_path: Path, transcript_dir: Path,
 CHUNK_SECONDS_DEFAULT = 1800  # 30 minutes
 
 
-def transcribe_chunked(mp3_path: Path, whisper, chunk_seconds: int = CHUNK_SECONDS_DEFAULT) -> dict:
+def transcribe_chunked(mp3_path: Path, whisper, chunk_seconds: int = CHUNK_SECONDS_DEFAULT,
+                       checkpoint_dir: Path | None = None) -> dict:
     """Transcribe a long mp3 by ffmpeg-slicing into chunks, then merging.
 
     For files at or below `chunk_seconds`, this is a single pass — no slicing.
     Otherwise it streams chunks through `whisper.transcribe` and stitches the
     results, adjusting segment timestamps by each chunk's start offset.
+
+    If `checkpoint_dir` is provided, each completed chunk's result is persisted
+    as `<checkpoint_dir>/<stem>/chunk_NNN.json`. A subsequent retry skips
+    chunks that already have a checkpoint, so a Whisper crash mid-file doesn't
+    cost the work already done. The chunk directory is cleaned up once all
+    chunks merge successfully.
     """
     duration = get_audio_duration_secs(mp3_path)
     if duration is None or duration <= chunk_seconds:
         return whisper.transcribe(audio_path=str(mp3_path))
 
+    import json
     import subprocess
     import tempfile
 
@@ -779,26 +787,56 @@ def transcribe_chunked(mp3_path: Path, whisper, chunk_seconds: int = CHUNK_SECON
     all_text: list[str] = []
     all_segments: list = []
 
+    cp_root = (checkpoint_dir / mp3_path.stem) if checkpoint_dir else None
+    if cp_root is not None:
+        cp_root.mkdir(parents=True, exist_ok=True)
+
     with tempfile.TemporaryDirectory(prefix="ss-chunks-") as tmpdir:
         tmp = Path(tmpdir)
         for i in range(n_chunks):
             start = i * chunk_seconds
-            chunk_path = tmp / f"chunk_{i:03d}.mp3"
-            # `-ss` before `-i` seeks before reading — fast for mp3 stream copy.
-            subprocess.run([
-                "ffmpeg", "-y", "-loglevel", "error",
-                "-ss", str(start), "-i", str(mp3_path),
-                "-t", str(chunk_seconds), "-c", "copy",
-                str(chunk_path),
-            ], check=True)
+            cp_file = (cp_root / f"chunk_{i:03d}.json") if cp_root else None
 
-            print(f"    ↻ Chunk {i+1}/{n_chunks} @{format_timestamp(start)}")
-            result = whisper.transcribe(audio_path=str(chunk_path))
-            all_text.append((result.get("text") or "").strip())
+            cached = None
+            if cp_file and cp_file.exists():
+                try:
+                    cached = json.loads(cp_file.read_text(encoding="utf-8"))
+                except Exception:
+                    cached = None
+
+            if cached is not None:
+                print(f"    ↻ Chunk {i+1}/{n_chunks} @{format_timestamp(start)} (cached)")
+                text = (cached.get("text") or "").strip()
+                segments = cached.get("segments") or []
+            else:
+                chunk_path = tmp / f"chunk_{i:03d}.mp3"
+                # `-ss` before `-i` seeks before reading — fast for mp3 stream copy.
+                subprocess.run([
+                    "ffmpeg", "-y", "-loglevel", "error",
+                    "-ss", str(start), "-i", str(mp3_path),
+                    "-t", str(chunk_seconds), "-c", "copy",
+                    str(chunk_path),
+                ], check=True)
+
+                print(f"    ↻ Chunk {i+1}/{n_chunks} @{format_timestamp(start)}")
+                result = whisper.transcribe(audio_path=str(chunk_path))
+                text = (result.get("text") or "").strip()
+                segments = result.get("segments") or []
+
+                if cp_file is not None:
+                    try:
+                        cp_file.write_text(
+                            json.dumps({"text": text, "segments": segments}),
+                            encoding="utf-8",
+                        )
+                    except OSError as e:
+                        print(f"    ⚠ Could not write checkpoint {cp_file.name}: {e}")
+
+            all_text.append(text)
 
             # lightning_whisper_mlx returns [start_cs, end_cs, text] per segment.
             offset_cs = int(start * 100)
-            for seg in result.get("segments") or []:
+            for seg in segments:
                 if isinstance(seg, (list, tuple)) and len(seg) >= 3:
                     all_segments.append([seg[0] + offset_cs, seg[1] + offset_cs, seg[2]])
                 elif isinstance(seg, dict):
@@ -806,6 +844,18 @@ def transcribe_chunked(mp3_path: Path, whisper, chunk_seconds: int = CHUNK_SECON
                     s["start"] = float(seg.get("start", 0)) + start
                     s["end"] = float(seg.get("end", 0)) + start
                     all_segments.append(s)
+
+    # All chunks merged successfully — remove the checkpoint dir.
+    if cp_root is not None and cp_root.is_dir():
+        for f in cp_root.iterdir():
+            try:
+                f.unlink()
+            except OSError:
+                pass
+        try:
+            cp_root.rmdir()
+        except OSError:
+            pass
 
     return {"text": " ".join(all_text), "segments": all_segments}
 
@@ -1459,7 +1509,7 @@ def run_transcribe(args):
                         save_diarization_cache(mp3_path, out_dir, speaker_turns)
 
             t0 = time.time()
-            result = transcribe_chunked(mp3_path, whisper)
+            result = transcribe_chunked(mp3_path, whisper, checkpoint_dir=out_dir / ".chunks")
             elapsed = time.time() - t0
             text = result["text"].strip()
 
