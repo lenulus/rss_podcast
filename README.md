@@ -6,9 +6,9 @@ Transcription runs locally on Apple Silicon via [Lightning Whisper MLX](https://
 
 ## Prerequisites
 
-- Python 3.9+
+- Python **3.11+** (3.9 works for everything except diarization, which requires `pyannote.audio` and bumps the floor to 3.11)
 - macOS with Apple Silicon (M1/M2/M3/M4) for GPU-accelerated transcription
-- `ffmpeg` (for audio duration detection): `brew install ffmpeg`
+- `ffmpeg` (`brew install ffmpeg`) — used for audio duration probing, WAV preconversion before diarization, and 30-min chunking on long audio files
 
 ## Setup
 
@@ -82,7 +82,7 @@ Audio lands in `./downloads/<feed-tag>/`:
 ./run.sh --feed nates-notebook --download --limit 10
 ```
 
-Downloads skip files that already exist locally or already have a transcript in the matching `./transcripts/<feed-tag>/` folder.
+Downloads skip episodes whose stem appears in `./transcripts/<feed-tag>/.processed` (the canonical "already handled" record — see the `.processed` section below) or already exist as an mp3 locally.
 
 ### Transcribe
 
@@ -97,7 +97,7 @@ Downloads skip files that already exist locally or already have a transcript in 
 ./run.sh --transcribe --feed nates-notebook --limit 5
 ```
 
-Transcription skips mp3s that already have a matching `.md` — safe to interrupt and resume.
+Transcription skips mp3s whose stem is already in `.processed` — safe to interrupt and resume. To force a re-transcribe, remove the stem from `.processed` (and optionally delete the `.md`).
 
 ### Fetch Substack-hosted transcripts
 
@@ -129,7 +129,7 @@ For episodes Substack already provides a transcript for (not all do):
 | `--transcribe` | | Transcribe mp3s locally with Whisper |
 | `--out DIR` | `./<kind>/<feed-tag>/` | Output directory override |
 | `--limit N` | unlimited | Max entries to process. Overrides `max_downloads_per_run` from `feeds.toml`. |
-| `--no-limit` | | Bypass `max_downloads_per_run` from `feeds.toml`. Useful for bulk pre-downloads on an unmetered network when you'll be processing the audio later at home. Conflicts with `--limit`; if both are given, `--limit` wins. |
+| `--no-limit` | | Bypass `max_downloads_per_run` from `feeds.toml`. Useful for bulk pre-downloads on an unmetered network when you'll be processing the audio later at home. Takes precedence over `--limit` if both are given. |
 | `--backfill-headers` | | Splice RSS-derived metadata (title, link, summary, etc.) into existing transcripts that don't yet have YAML frontmatter. Idempotent. Use with `--feed <tag>` to scope to one feed. |
 | `--model SIZE` | `medium` | `tiny`, `base`, `small`, `medium`, `large-v3` |
 | `--mp3-dir DIR` | derived from `--feed` | mp3 source for `--transcribe` |
@@ -169,7 +169,9 @@ grep -rl "context engineering" ./transcripts/
 
 ## Output format
 
-Transcripts are saved as Markdown files named `YYYY-MM-DD - Episode Title.md` under `./transcripts/<feed-tag>/`. Downloaded mp3s use the same naming under `./downloads/<feed-tag>/`.
+Transcripts are Markdown files named `YYYY-MM-DD - Episode Title.md` under `./transcripts/<feed-tag>/`. Downloaded mp3s use the same naming under `./downloads/<feed-tag>/`. Each transcript opens with YAML frontmatter (title, date, show, host, link, duration, guid) plus a visible header containing the episode's full RSS description and a Show notes link — see the [Episode metadata](#episode-metadata-in-transcripts) section. Diarized transcripts emit `**Speaker A** (mm:ss):` blocks per turn.
+
+Sidecars: `./downloads/<feed-tag>/<stem>.meta.json` (small, paired with the mp3, removed during eviction) and `./transcripts/<feed-tag>/.diarize/<stem>.json` (cached pyannote output, lets a retry skip the diarize pass).
 
 ## Speaker diarization (optional)
 
