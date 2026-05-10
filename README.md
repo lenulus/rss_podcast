@@ -196,6 +196,21 @@ Diarization runs alongside Whisper — net wall-clock is roughly 2× the transcr
 
 For one-off testing, `--diarize` / `--no-diarize` on the CLI overrides whatever's in `feeds.toml`.
 
+### Chapter timestamps
+
+When the RSS description contains an outline like:
+
+```
+OUTLINE:
+(00:00) – Introduction
+(03:00) – Sponsors, Comments, and Reflections
+(14:08) – Codecs
+```
+
+…the transcript gets `## Title (mm:ss)` headings injected inline, so Obsidian's outline view becomes a navigable chapter index. Detection handles parenthesized, bracketed, and plain line-start formats; works whether chapters are on separate lines (Lex) or run together on one line (Dwarkesh).
+
+Chapter injection is also applied during `--backfill-headers`, so existing transcripts get chapters without re-transcribing. Idempotent — re-running strips and re-injects, so the output is stable.
+
 ### Host naming
 
 When the feed's host is known (extracted from the RSS `itunes_author` or set explicitly via `host = "Lex Fridman"` in `feeds.toml`), the speaker who talks the most in the first 60 seconds of the episode gets rendered with the host's first name instead of `Speaker A`:

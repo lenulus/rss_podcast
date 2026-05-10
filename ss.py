@@ -535,6 +535,70 @@ def align_segments_to_speakers(segments: list, turns: list) -> list[dict]:
     return aligned
 
 
+def _parse_chapter_timestamp(ts: str) -> float:
+    """'14:08' → 848, '1:23:45' → 5025. Returns 0.0 on malformed input."""
+    parts = ts.split(":")
+    try:
+        if len(parts) == 2:
+            return int(parts[0]) * 60 + int(parts[1])
+        if len(parts) == 3:
+            return int(parts[0]) * 3600 + int(parts[1]) * 60 + int(parts[2])
+    except ValueError:
+        pass
+    return 0.0
+
+
+def parse_chapters_from_description(description: str) -> list[tuple[float, str]]:
+    """Extract chapter markers from a podcast description.
+
+    Handles three common formats, tried in order. First matching pattern wins
+    (so we don't pick up stray timestamps from sponsor blurbs after the real
+    outline):
+
+        (00:00) – Introduction       Lex, Dwarkesh, many others
+        [00:00] Introduction         bracketed
+        00:00  Introduction          plain, line-start
+
+    Duplicate (time, title) entries are dropped; results sorted by time.
+    """
+    # Title capture stops at the next timestamp marker, an end-of-line, or
+    # end-of-input — this handles both line-broken outlines (Lex) and
+    # run-together single-line outlines (Dwarkesh).
+    patterns = [
+        # (H:MM:SS) – Title
+        re.compile(
+            r"\((\d{1,2}:\d{2}(?::\d{2})?)\)\s*[–—\-:]?\s*(.+?)(?=\s*\(\d{1,2}:\d{2}|\s*\[\d{1,2}:\d{2}|$|\n|\r)",
+            re.MULTILINE,
+        ),
+        # [H:MM:SS] Title
+        re.compile(
+            r"\[(\d{1,2}:\d{2}(?::\d{2})?)\]\s*(.+?)(?=\s*\(\d{1,2}:\d{2}|\s*\[\d{1,2}:\d{2}|$|\n|\r)",
+            re.MULTILINE,
+        ),
+        # H:MM:SS Title  (line-start; requires at least one space before title)
+        re.compile(r"^\s*(\d{1,2}:\d{2}(?::\d{2})?)\s+([^\n\r]+)", re.MULTILINE),
+    ]
+    for pat in patterns:
+        raw = [(m.group(1), m.group(2).strip()) for m in pat.finditer(description)]
+        # Drop "titles" that are just URLs (common in sponsor lines).
+        raw = [(ts, t) for ts, t in raw
+               if t and not t.startswith(("http://", "https://"))]
+        if not raw:
+            continue
+        seen = set()
+        out: list[tuple[float, str]] = []
+        for ts, title in raw:
+            secs = _parse_chapter_timestamp(ts)
+            title = title.rstrip(".,;")
+            key = (round(secs), title.lower())
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append((secs, title))
+        return sorted(out, key=lambda c: c[0])
+    return []
+
+
 def detect_host_speaker_label(aligned: list[dict], window_seconds: float = 60.0) -> str | None:
     """Return the pyannote label that talks the most in the opening window.
 
@@ -566,11 +630,15 @@ def _host_display_name(host_full: str | None) -> str | None:
 
 
 def _render_diarized_body(aligned: list[dict], host_label: str | None = None,
-                          host_name: str | None = None) -> str:
+                          host_name: str | None = None,
+                          chapters: list[tuple[float, str]] | None = None) -> str:
     """Render aligned segments as **Speaker X** (mm:ss): blocks (no header).
 
     If host_label + host_name are provided, segments whose pyannote label
     matches host_label render as `**<host_name>**` instead of `**Speaker A**`.
+    If chapters is provided, `## Title (mm:ss)` headings are inserted
+    between paragraphs at the appropriate timestamps so Obsidian's outline
+    picks them up.
     """
     if not aligned:
         return "(no segments produced)\n"
@@ -580,13 +648,23 @@ def _render_diarized_body(aligned: list[dict], host_label: str | None = None,
             return f"**{host_name}**"
         return f"**Speaker {humanize_speaker(speaker_id)}**"
 
+    pending = sorted(chapters or [], key=lambda c: c[0])
+
     lines: list[str] = []
     current_speaker = None
     block_start = 0.0
     buffer: list[str] = []
 
+    def emit_chapters_up_to(time_seconds: float):
+        nonlocal pending
+        while pending and pending[0][0] <= time_seconds:
+            ts_s, title = pending.pop(0)
+            lines.append(f"## {title} ({format_timestamp(ts_s)})")
+            lines.append("")
+
     def flush():
         if buffer and current_speaker is not None:
+            emit_chapters_up_to(block_start)
             ts = format_timestamp(block_start)
             lines.append(f"{label_for(current_speaker)} ({ts}):")
             joined = " ".join(s.strip() for s in buffer if s.strip())
@@ -601,19 +679,30 @@ def _render_diarized_body(aligned: list[dict], host_label: str | None = None,
             buffer = []
         buffer.append(seg["text"])
     flush()
+
+    # Any chapters past the last paragraph (rare) still get emitted at the end.
+    while pending:
+        ts_s, title = pending.pop(0)
+        lines.append(f"## {title} ({format_timestamp(ts_s)})")
+        lines.append("")
+
     return "\n".join(lines).rstrip() + "\n"
 
 
 def render_diarized_markdown(stem: str, aligned: list[dict], meta: dict | None = None,
                               host_name: str | None = None) -> str:
-    """Diarized markdown with optional metadata header and host-aware speaker labels.
+    """Diarized markdown with optional metadata header, host-aware labels, and chapters.
 
     `host_name` (typically the host's first name) triggers the host-detection
     heuristic — whichever pyannote speaker talks most in the first minute
-    gets rendered with that name instead of `Speaker A`.
+    gets rendered with that name instead of `Speaker A`. Chapter markers in
+    the description (e.g. `(14:08) – Codecs`) become `## Codecs (14:08)`
+    headings inline.
     """
     host_label = detect_host_speaker_label(aligned) if host_name else None
-    body = _render_diarized_body(aligned, host_label=host_label, host_name=host_name)
+    chapters = parse_chapters_from_description(meta.get("summary", "")) if meta else []
+    body = _render_diarized_body(aligned, host_label=host_label,
+                                 host_name=host_name, chapters=chapters)
     header = render_metadata_header(meta) if meta else f"# {stem}\n\n---\n\n"
     return header + body
 
@@ -1095,6 +1184,45 @@ def run_fetch(feed, args):
         backup_feed_transcripts(args.feed, args._feed_cfg)
 
 
+def inject_chapters_into_body(body: str, chapters: list[tuple[float, str]]) -> str:
+    """Inject ## Title (mm:ss) headings before paragraphs at chapter boundaries.
+
+    Operates on a rendered transcript body. Locates speaker-paragraph headers
+    (`**Whoever** (mm:ss):`) and inserts a chapter heading just before each
+    paragraph whose start time is past one of the pending chapter timestamps.
+
+    Removes any pre-existing `## ... (mm:ss)` headings in the body so the
+    function is idempotent — re-running over an already-chaptered body
+    produces the same output.
+    """
+    if not chapters:
+        return body
+
+    # Idempotency: strip any pre-existing chapter headings before re-injecting.
+    body = re.sub(r"^## .+ \(\d{1,2}:\d{2}(?::\d{2})?\)\n+", "", body, flags=re.MULTILINE)
+
+    pending = sorted(chapters, key=lambda c: c[0])
+    speaker_line_re = re.compile(r"^\*\*[^*]+\*\* \((\d{1,2}:\d{2}(?::\d{2})?)\):", re.MULTILINE)
+    matches = list(speaker_line_re.finditer(body))
+    if not matches:
+        return body
+
+    parts: list[str] = []
+    last_end = 0
+    for m in matches:
+        para_start_secs = _parse_chapter_timestamp(m.group(1))
+        parts.append(body[last_end:m.start()])
+        while pending and pending[0][0] <= para_start_secs:
+            ts, title = pending.pop(0)
+            parts.append(f"## {title} ({format_timestamp(ts)})\n\n")
+        last_end = m.start()
+    parts.append(body[last_end:])
+    while pending:
+        ts, title = pending.pop(0)
+        parts.append(f"\n## {title} ({format_timestamp(ts)})\n")
+    return "".join(parts)
+
+
 def _split_existing_body(content: str) -> str:
     """Strip the existing markdown header from a legacy transcript, return body.
 
@@ -1157,22 +1285,44 @@ def run_backfill_headers(args):
                 continue
 
         md_files = sorted(transcript_dir.glob("*.md"))
-        updated = already = unmatched = 0
+        updated = already = unmatched = chaptered = 0
         for md_path in md_files:
             existing = md_path.read_text(encoding="utf-8")
-            if existing.startswith("---\n"):
-                already += 1
-                continue
+            has_frontmatter = existing.startswith("---\n")
             meta = meta_by_stem.get(md_path.stem)
             if not meta:
-                unmatched += 1
+                if not has_frontmatter:
+                    unmatched += 1
+                else:
+                    already += 1
                 continue
-            body = _split_existing_body(existing)
-            md_path.write_text(render_metadata_header(meta) + body, encoding="utf-8")
+
+            # Body extraction depends on whether there's already a header.
+            if has_frontmatter:
+                # Strip existing frontmatter so we can re-inject chapters into
+                # the body without duplicating headers.
+                _, _, after_close = existing.partition("---\n")
+                _, _, body = after_close.partition("\n---\n")
+                body = body.lstrip("\n")
+            else:
+                body = _split_existing_body(existing)
+
+            chapters = parse_chapters_from_description(meta.get("summary", ""))
+            had_chapters_before = bool(re.search(r"^## .+ \(\d{1,2}:\d{2}", body, re.MULTILINE))
+            new_body = inject_chapters_into_body(body, chapters) if chapters else body
+
+            new_content = render_metadata_header(meta) + new_body
+            if new_content == existing:
+                already += 1
+                continue
+            md_path.write_text(new_content, encoding="utf-8")
             updated += 1
+            if chapters and not had_chapters_before:
+                chaptered += 1
 
         print(f"  [{tag}] {len(md_files)} transcripts: "
-              f"{updated} updated, {already} already-headered, "
+              f"{updated} updated ({chaptered} newly chaptered), "
+              f"{already} already current, "
               f"{unmatched} no RSS match (likely rotated out)")
         grand_updated += updated
         grand_skipped += already
