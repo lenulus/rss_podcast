@@ -535,10 +535,50 @@ def align_segments_to_speakers(segments: list, turns: list) -> list[dict]:
     return aligned
 
 
-def _render_diarized_body(aligned: list[dict]) -> str:
-    """Render aligned segments as **Speaker X** (mm:ss): blocks (no header)."""
+def detect_host_speaker_label(aligned: list[dict], window_seconds: float = 60.0) -> str | None:
+    """Return the pyannote label that talks the most in the opening window.
+
+    For interview shows the host almost always introduces the episode in the
+    first minute, so whichever speaker accumulates the most aligned talk time
+    in [0, window_seconds] is a strong host signal. Returns None if there are
+    no segments in that window.
+    """
+    talk_time: dict[str, float] = {}
+    for seg in aligned:
+        if seg.get("start", 0) >= window_seconds:
+            break
+        end_in_window = min(seg.get("end", 0), window_seconds)
+        dur = max(0.0, end_in_window - seg.get("start", 0))
+        if dur <= 0:
+            continue
+        talk_time[seg["speaker"]] = talk_time.get(seg["speaker"], 0.0) + dur
+    if not talk_time:
+        return None
+    return max(talk_time.items(), key=lambda kv: kv[1])[0]
+
+
+def _host_display_name(host_full: str | None) -> str | None:
+    """Trim the full host name to a single-token display label ('Lex' from 'Lex Fridman')."""
+    if not host_full:
+        return None
+    token = host_full.strip().split()[0] if host_full.strip() else ""
+    return token or None
+
+
+def _render_diarized_body(aligned: list[dict], host_label: str | None = None,
+                          host_name: str | None = None) -> str:
+    """Render aligned segments as **Speaker X** (mm:ss): blocks (no header).
+
+    If host_label + host_name are provided, segments whose pyannote label
+    matches host_label render as `**<host_name>**` instead of `**Speaker A**`.
+    """
     if not aligned:
         return "(no segments produced)\n"
+
+    def label_for(speaker_id: str) -> str:
+        if host_label and host_name and speaker_id == host_label:
+            return f"**{host_name}**"
+        return f"**Speaker {humanize_speaker(speaker_id)}**"
 
     lines: list[str] = []
     current_speaker = None
@@ -547,9 +587,8 @@ def _render_diarized_body(aligned: list[dict]) -> str:
 
     def flush():
         if buffer and current_speaker is not None:
-            label = humanize_speaker(current_speaker)
             ts = format_timestamp(block_start)
-            lines.append(f"**Speaker {label}** ({ts}):")
+            lines.append(f"{label_for(current_speaker)} ({ts}):")
             joined = " ".join(s.strip() for s in buffer if s.strip())
             lines.append(collapse_repetitions(joined))
             lines.append("")
@@ -565,9 +604,16 @@ def _render_diarized_body(aligned: list[dict]) -> str:
     return "\n".join(lines).rstrip() + "\n"
 
 
-def render_diarized_markdown(stem: str, aligned: list[dict], meta: dict | None = None) -> str:
-    """Diarized markdown with optional metadata header."""
-    body = _render_diarized_body(aligned)
+def render_diarized_markdown(stem: str, aligned: list[dict], meta: dict | None = None,
+                              host_name: str | None = None) -> str:
+    """Diarized markdown with optional metadata header and host-aware speaker labels.
+
+    `host_name` (typically the host's first name) triggers the host-detection
+    heuristic — whichever pyannote speaker talks most in the first minute
+    gets rendered with that name instead of `Speaker A`.
+    """
+    host_label = detect_host_speaker_label(aligned) if host_name else None
+    body = _render_diarized_body(aligned, host_label=host_label, host_name=host_name)
     header = render_metadata_header(meta) if meta else f"# {stem}\n\n---\n\n"
     return header + body
 
@@ -1278,9 +1324,15 @@ def run_transcribe(args):
             out_path = out_dir / f"{mp3_path.stem}.md"
             segments = result.get("segments") or []
             meta = load_metadata_sidecar(mp3_path)
+            # Resolve host display name: per-feed TOML `host` wins, else use the
+            # RSS-derived host stored in the metadata sidecar. Trim to first token
+            # so the on-page label reads naturally ("Lex" not "Lex Fridman").
+            cfg_for_pair = feed_cfg_for(config, mp3_dir.name)
+            host_full = cfg_for_pair.get("host") or (meta.get("host") if meta else "")
+            host_display = _host_display_name(host_full)
             if speaker_turns and segments:
                 aligned = align_segments_to_speakers(segments, speaker_turns)
-                content = render_diarized_markdown(mp3_path.stem, aligned, meta)
+                content = render_diarized_markdown(mp3_path.stem, aligned, meta, host_name=host_display)
             else:
                 if do_diarize and not segments:
                     print(f"    ⚠ Whisper returned no segments — saving flat transcript.")

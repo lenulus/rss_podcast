@@ -54,6 +54,11 @@ rss = "https://api.substack.com/feed/podcast/XXXXXX/private-key.rss"
 # diarizing a single-speaker recording adds runtime and noisy headers.
 # diarize = true
 
+# Override the RSS-derived host name. The most-talked speaker in the first
+# minute of the episode is rendered with this person's first name instead
+# of "Speaker A". Defaults to itunes_author from the RSS channel.
+# host = "Lex Fridman"
+
 # Lightning Whisper MLX batch size (default 12). Lower this for very long
 # episodes (3 + hours) that trip Metal GPU command-buffer timeouts —
 # smaller batches mean smaller per-op GPU work. Costs roughly proportional

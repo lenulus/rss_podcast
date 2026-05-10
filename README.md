@@ -61,6 +61,7 @@ These can be set under `[defaults]` (applies to every feed) or under `[feeds.<ta
 | `download_order` | `"newest"` (default) or `"oldest"`. Use `"oldest"` for incremental backfill of an archive. |
 | `diarize` | `true` runs speaker diarization (pyannote.audio) during `--transcribe`. The `.md` output gains `**Speaker A** (mm:ss):` headers per turn. Adds runtime and a one-time HuggingFace setup; opt-in per feed. |
 | `whisper_batch_size` | Lightning Whisper MLX batch size (default `12`). Lower it (e.g. `6`) for very long episodes (3+ hours) that trip Metal GPU command-buffer timeouts. Tradeoff: ~linear slowdown. |
+| `host` | Override the RSS-derived host name. Used for diarization speaker-naming (most-talked speaker in first 60s renders as `**<first-name>**` instead of `Speaker A`). Defaults to whatever the feed's `itunes_author` says. |
 
 ## Usage
 
@@ -194,6 +195,20 @@ One-time setup:
 Diarization runs alongside Whisper — net wall-clock is roughly 2× the transcribe-only time. Speaker labels are generic (`A`, `B`, …) per-episode; they do not carry across episodes.
 
 For one-off testing, `--diarize` / `--no-diarize` on the CLI overrides whatever's in `feeds.toml`.
+
+### Host naming
+
+When the feed's host is known (extracted from the RSS `itunes_author` or set explicitly via `host = "Lex Fridman"` in `feeds.toml`), the speaker who talks the most in the first 60 seconds of the episode gets rendered with the host's first name instead of `Speaker A`:
+
+```
+**Lex** (00:00):
+…intro…
+
+**Speaker B** (01:42):
+…guest's response…
+```
+
+The detection is heuristic — interview shows almost always open with the host introducing the episode. Other speakers keep the generic `Speaker B/C/…` labels. The mapping only applies to new transcriptions; to relabel an existing transcript, remove its stem from `.processed` and re-run `--transcribe` (the diarization cache keeps this cheap).
 
 ## Episode metadata in transcripts
 
