@@ -1273,6 +1273,115 @@ def inject_chapters_into_body(body: str, chapters: list[tuple[float, str]]) -> s
     return "".join(parts)
 
 
+def _media_dir_path(tag: str, feed_cfg: dict) -> Path | None:
+    """Read-only path resolution for mp3 backups — does not mkdir."""
+    if feed_cfg.get("media_dir"):
+        return Path(feed_cfg["media_dir"])
+    if feed_cfg.get("backup_path"):
+        return Path(feed_cfg["backup_path"]) / tag / "media"
+    return None
+
+
+def _text_dir_path(tag: str, feed_cfg: dict) -> Path | None:
+    """Read-only path resolution for transcript backups — does not mkdir."""
+    if feed_cfg.get("transcript_dir"):
+        return Path(feed_cfg["transcript_dir"])
+    if feed_cfg.get("backup_path"):
+        return Path(feed_cfg["backup_path"]) / tag / "text"
+    return None
+
+
+def _count_files(path: Path | None, glob: str) -> int | None:
+    """Count files matching glob, excluding AppleDouble (._*) sidecars.
+
+    Returns None if the path doesn't exist (used to render '—' in tables).
+    """
+    if path is None or not path.is_dir():
+        return None
+    return sum(1 for p in path.glob(glob) if not p.name.startswith("._"))
+
+
+def run_status(args):
+    """Print a per-feed health snapshot — RSS, local, SD card, gaps."""
+    config = getattr(args, "_config", {}) or {}
+    feeds = config.get("feeds", {})
+    if args.feed:
+        feeds = {args.feed: feeds[args.feed]} if args.feed in feeds else {}
+    if not feeds:
+        sys.exit("No feeds in config.")
+
+    rows = []
+    for tag in feeds:
+        cfg = feed_cfg_for(config, tag)
+
+        rss_count: str = "—"
+        if not args.offline and cfg.get("rss"):
+            try:
+                feed = feedparser.parse(cfg["rss"])
+                rss_count = str(len(feed.entries))
+            except Exception:
+                rss_count = "ERR"
+
+        mp3_dir = Path(f"./downloads/{tag}")
+        local_mp3 = sum(1 for _ in mp3_dir.glob("*.mp3")) if mp3_dir.is_dir() else 0
+
+        processed = load_processed(tag) if Path(f"./transcripts/{tag}").is_dir() else set()
+        done_count = len(processed)
+
+        # Orphan mp3s: present locally but no .processed entry → needs transcribing.
+        orphan = 0
+        if mp3_dir.is_dir():
+            orphan = sum(1 for p in mp3_dir.glob("*.mp3") if p.stem not in processed)
+
+        # Headerless: .md without YAML frontmatter (i.e. metadata never landed).
+        transcript_dir = Path(f"./transcripts/{tag}")
+        headerless = 0
+        if transcript_dir.is_dir():
+            for md in transcript_dir.glob("*.md"):
+                try:
+                    with md.open(encoding="utf-8") as f:
+                        if not f.readline().startswith("---"):
+                            headerless += 1
+                except OSError:
+                    pass
+
+        sd_media = _count_files(_media_dir_path(tag, cfg), "*.mp3")
+        sd_text = _count_files(_text_dir_path(tag, cfg), "*.md")
+
+        rows.append({
+            "tag": tag,
+            "rss": rss_count,
+            "local": local_mp3,
+            "done": done_count,
+            "sd_media": sd_media if sd_media is not None else "—",
+            "sd_text": sd_text if sd_text is not None else "—",
+            "orphan": orphan,
+            "no_header": headerless,
+        })
+
+    # Layout
+    cols = [
+        ("Feed",      "tag",       18, "<"),
+        ("RSS",       "rss",        5, ">"),
+        ("Local",     "local",      6, ">"),
+        ("Done",      "done",       5, ">"),
+        ("SD-media",  "sd_media",   9, ">"),
+        ("SD-text",   "sd_text",    8, ">"),
+        ("Orphan",    "orphan",     7, ">"),
+        ("No-hdr",    "no_header",  7, ">"),
+    ]
+    print("  ".join(f"{h:{align}{w}}" for h, _, w, align in cols))
+    print("  ".join("-" * w for _, _, w, _ in cols))
+    for r in rows:
+        print("  ".join(f"{str(r[key]):{align}{w}}" for _, key, w, align in cols))
+
+    print()
+    print("Legend:")
+    print("  Done    = episode stems in .processed (canonical 'transcribed')")
+    print("  Orphan  = local mp3 without a matching .processed entry (still needs transcribing)")
+    print("  No-hdr  = local transcripts without YAML frontmatter (run --backfill-headers)")
+
+
 def _split_existing_body(content: str) -> str:
     """Strip the existing markdown header from a legacy transcript, return body.
 
@@ -1576,10 +1685,18 @@ def main():
                         help="For existing transcripts, fetch each feed's RSS and splice "
                              "metadata (title, link, summary, etc.) into the .md header. "
                              "Skips files that already have YAML frontmatter.")
+    parser.add_argument("--status", action="store_true",
+                        help="Print a per-feed health snapshot (RSS, local, SD card, gaps).")
+    parser.add_argument("--offline", action="store_true",
+                        help="With --status, skip the RSS fetch and use only local data.")
     args = parser.parse_args()
 
     config = load_config(Path(args.config))
     resolve_feed(args, config)
+
+    if args.status:
+        run_status(args)
+        return
 
     if args.backfill_headers:
         run_backfill_headers(args)
