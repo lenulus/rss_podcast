@@ -238,6 +238,127 @@ def get_audio_duration_secs(mp3_path: Path) -> float | None:
         return None
 
 
+# ── Episode metadata (RSS → sidecar → markdown header) ───────────────────────
+#
+# At download time we capture useful RSS fields into a JSON sidecar next to
+# the mp3. Transcribe reads the sidecar and renders a YAML frontmatter +
+# visible header at the top of the .md. The sidecar is paired with the mp3
+# and removed during eviction.
+
+def extract_episode_metadata(entry, feed) -> dict:
+    """Pull useful fields from a feedparser entry into a serializable dict."""
+    import html as _html
+    summary_raw = entry.get("summary", "") or entry.get("description", "")
+    # Strip HTML tags, decode entities, normalize line endings.
+    summary = re.sub(r"<[^>]+>", "", summary_raw)
+    summary = _html.unescape(summary).replace("\r\n", "\n").replace("\r", "\n").strip()
+
+    duration = entry.get("itunes_duration", "")
+    if duration and ":" not in str(duration):
+        try:
+            duration = format_timestamp(int(duration))
+        except (ValueError, TypeError):
+            duration = str(duration)
+
+    pub_date = ""
+    if entry.get("published"):
+        try:
+            pub_date = parsedate_to_datetime(entry.published).astimezone(timezone.utc).strftime("%Y-%m-%d")
+        except Exception:
+            pass
+
+    return {
+        "title": entry.get("title", "").strip(),
+        "link": entry.get("link", "").strip(),
+        "summary": summary,
+        "duration": str(duration) if duration else "",
+        "pub_date": pub_date,
+        "show": (feed.feed.get("title", "") or "").strip(),
+        "host": (feed.feed.get("itunes_author", "") or feed.feed.get("author", "") or "").strip(),
+        "guid": (entry.get("id", "") or entry.get("guid", "") or "").strip(),
+    }
+
+
+def metadata_sidecar_path(mp3_path: Path) -> Path:
+    """Sidecar location next to the mp3."""
+    return mp3_path.with_suffix(".meta.json")
+
+
+def write_metadata_sidecar(mp3_path: Path, meta: dict) -> None:
+    """Persist episode metadata next to the mp3 for later use by --transcribe."""
+    import json
+    metadata_sidecar_path(mp3_path).write_text(json.dumps(meta, indent=2), encoding="utf-8")
+
+
+def load_metadata_sidecar(mp3_path: Path) -> dict | None:
+    """Read sidecar if it exists; otherwise return None (legacy mp3 with no metadata)."""
+    import json
+    p = metadata_sidecar_path(mp3_path)
+    if not p.exists():
+        return None
+    try:
+        return json.loads(p.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+
+
+def _yaml_escape(s: str) -> str:
+    """Quote a single-line string for YAML if it contains special characters."""
+    s_str = str(s) if s is not None else ""
+    if not s_str:
+        return '""'
+    if any(c in s_str for c in (':', '"', "'", '#', '\n', '[', ']', '{', '}', ',', '&', '*', '!', '|', '>', '%', '@', '`')) \
+            or s_str[0] in ('-', '?', '"') \
+            or s_str.strip() != s_str:
+        return '"' + s_str.replace("\\", "\\\\").replace('"', '\\"') + '"'
+    return s_str
+
+
+def render_metadata_header(meta: dict | None) -> str:
+    """YAML frontmatter + visible markdown header, ending with the body separator.
+
+    Returns "" if `meta` is empty/None — caller can fall back to a minimal
+    header. The output ends with `---\\n\\n` so the body can be concatenated
+    directly.
+    """
+    if not meta:
+        return ""
+
+    title = meta.get("title", "")
+    pub_date = meta.get("pub_date", "")
+    show = meta.get("show", "")
+    host = meta.get("host", "")
+    link = meta.get("link", "")
+    duration = meta.get("duration", "")
+    guid = meta.get("guid", "")
+    summary = meta.get("summary", "")
+
+    fm: list[str] = ["---"]
+    if title:    fm.append(f"title: {_yaml_escape(title)}")
+    if pub_date: fm.append(f"date: {pub_date}")
+    if show:     fm.append(f"show: {_yaml_escape(show)}")
+    if host:     fm.append(f"host: {_yaml_escape(host)}")
+    if link:     fm.append(f"link: {_yaml_escape(link)}")
+    if duration: fm.append(f"duration: {_yaml_escape(duration)}")
+    if guid:     fm.append(f"guid: {_yaml_escape(guid)}")
+    fm.append("---")
+    fm.append("")
+    if title:
+        fm.append(f"# {title}")
+        fm.append("")
+    if summary:
+        for line in summary.split("\n"):
+            stripped = line.strip()
+            fm.append(f"> {stripped}" if stripped else ">")
+        fm.append("")
+    if link:
+        fm.append(f"[Show notes]({link})")
+        fm.append("")
+    fm.append("---")
+    fm.append("")
+    return "\n".join(fm) + "\n"
+
+
 # ── Whisper repetition-loop cleanup ───────────────────────────────────────────
 #
 # Whisper occasionally gets stuck producing the same sentence over and over —
@@ -414,12 +535,12 @@ def align_segments_to_speakers(segments: list, turns: list) -> list[dict]:
     return aligned
 
 
-def render_diarized_markdown(stem: str, aligned: list[dict]) -> str:
-    """Render aligned segments with **Speaker X** (mm:ss): headers per turn."""
+def _render_diarized_body(aligned: list[dict]) -> str:
+    """Render aligned segments as **Speaker X** (mm:ss): blocks (no header)."""
     if not aligned:
-        return f"# {stem}\n\n---\n\n(no segments produced)\n"
+        return "(no segments produced)\n"
 
-    lines = [f"# {stem}", "", "---", ""]
+    lines: list[str] = []
     current_speaker = None
     block_start = 0.0
     buffer: list[str] = []
@@ -442,6 +563,20 @@ def render_diarized_markdown(stem: str, aligned: list[dict]) -> str:
         buffer.append(seg["text"])
     flush()
     return "\n".join(lines).rstrip() + "\n"
+
+
+def render_diarized_markdown(stem: str, aligned: list[dict], meta: dict | None = None) -> str:
+    """Diarized markdown with optional metadata header."""
+    body = _render_diarized_body(aligned)
+    header = render_metadata_header(meta) if meta else f"# {stem}\n\n---\n\n"
+    return header + body
+
+
+def render_flat_markdown(stem: str, text: str, meta: dict | None = None) -> str:
+    """Flat (non-diarized) markdown with optional metadata header."""
+    cleaned = collapse_repetitions(text)
+    header = render_metadata_header(meta) if meta else f"# {stem}\n\n---\n\n"
+    return header + cleaned + "\n"
 
 
 def should_diarize(args, feed_cfg: dict) -> bool:
@@ -758,6 +893,15 @@ def prune_feed_mp3s(tag: str, feed_cfg: dict) -> None:
             print(f"    🗑 Evicted: {mp3.name}")
         except OSError as e:
             print(f"    ✗ Could not delete {mp3.name}: {e}")
+            continue
+        # Drop the matching metadata sidecar — its contents are already in
+        # the rendered transcript and have no other consumer.
+        sidecar = metadata_sidecar_path(mp3)
+        if sidecar.exists():
+            try:
+                sidecar.unlink()
+            except OSError:
+                pass
 
 
 # ── Commands ──────────────────────────────────────────────────────────────────
@@ -824,6 +968,10 @@ def run_download(feed, args):
 
         out_path = out_dir / f"{stem}.mp3"
         if download_file(audio_url, out_path):
+            try:
+                write_metadata_sidecar(out_path, extract_episode_metadata(entry, feed))
+            except Exception as e:
+                print(f"    ⚠ Could not write metadata sidecar: {e}")
             fetched += 1
             skip.add(stem)
 
@@ -899,6 +1047,96 @@ def run_fetch(feed, args):
 
     if args.feed:
         backup_feed_transcripts(args.feed, args._feed_cfg)
+
+
+def _split_existing_body(content: str) -> str:
+    """Strip the existing markdown header from a legacy transcript, return body.
+
+    Old format(s) end with `\\n---\\n\\n` separating header from body. We split
+    on the FIRST such separator and keep everything after it. Files that
+    already have YAML frontmatter (start with `---\\n`) are detected upstream
+    and not passed here.
+    """
+    sep = "\n---\n\n"
+    idx = content.find(sep)
+    if idx >= 0:
+        return content[idx + len(sep):]
+    # Files that don't have a separator at all → treat the entire content as body.
+    return content
+
+
+def run_backfill_headers(args):
+    """For each feed in config, fetch RSS and splice metadata into existing transcripts.
+
+    Skips files that already start with YAML frontmatter (`---\\n`). Reports
+    counts per feed of: updated, already-headered, no-RSS-match, missing-feed.
+    """
+    config = getattr(args, "_config", {}) or {}
+    feeds = config.get("feeds", {})
+    if args.feed:
+        if args.feed not in feeds:
+            sys.exit(f"Feed '{args.feed}' not in {args.config}.")
+        feeds = {args.feed: feeds[args.feed]}
+
+    if not feeds:
+        sys.exit("No feeds in config.")
+
+    grand_updated = grand_skipped = grand_unmatched = 0
+    for tag, _ in feeds.items():
+        cfg = feed_cfg_for(config, tag)
+        rss = cfg.get("rss")
+        if not rss:
+            print(f"\n[{tag}] no rss in config — skipping.")
+            continue
+
+        transcript_dir = Path(f"./transcripts/{tag}")
+        if not transcript_dir.is_dir():
+            print(f"\n[{tag}] no transcript directory — skipping.")
+            continue
+
+        print(f"\n[{tag}] Fetching RSS...")
+        feed = feedparser.parse(rss)
+        if not feed.entries:
+            print(f"  ✗ No entries from RSS.")
+            continue
+
+        # Build stem → metadata map (mirroring how run_download names files).
+        meta_by_stem: dict[str, dict] = {}
+        for entry in feed.entries:
+            try:
+                pub_date = pub_date_to_iso(entry)
+                stem = f"{pub_date} - {sanitize_filename(entry.title)}"
+                meta_by_stem[stem] = extract_episode_metadata(entry, feed)
+            except Exception:
+                continue
+
+        md_files = sorted(transcript_dir.glob("*.md"))
+        updated = already = unmatched = 0
+        for md_path in md_files:
+            existing = md_path.read_text(encoding="utf-8")
+            if existing.startswith("---\n"):
+                already += 1
+                continue
+            meta = meta_by_stem.get(md_path.stem)
+            if not meta:
+                unmatched += 1
+                continue
+            body = _split_existing_body(existing)
+            md_path.write_text(render_metadata_header(meta) + body, encoding="utf-8")
+            updated += 1
+
+        print(f"  [{tag}] {len(md_files)} transcripts: "
+              f"{updated} updated, {already} already-headered, "
+              f"{unmatched} no RSS match (likely rotated out)")
+        grand_updated += updated
+        grand_skipped += already
+        grand_unmatched += unmatched
+
+        # Refresh SD card backups so the headers propagate.
+        backup_feed_transcripts(tag, cfg)
+
+    print(f"\nDone. {grand_updated} updated, {grand_skipped} already had headers, "
+          f"{grand_unmatched} not in current RSS.")
 
 
 def transcribe_pairs(args) -> list[tuple[Path, Path]]:
@@ -1039,14 +1277,14 @@ def run_transcribe(args):
 
             out_path = out_dir / f"{mp3_path.stem}.md"
             segments = result.get("segments") or []
+            meta = load_metadata_sidecar(mp3_path)
             if speaker_turns and segments:
                 aligned = align_segments_to_speakers(segments, speaker_turns)
-                content = render_diarized_markdown(mp3_path.stem, aligned)
+                content = render_diarized_markdown(mp3_path.stem, aligned, meta)
             else:
                 if do_diarize and not segments:
                     print(f"    ⚠ Whisper returned no segments — saving flat transcript.")
-                cleaned = collapse_repetitions(text)
-                content = f"# {mp3_path.stem}\n\n---\n\n{cleaned}\n"
+                content = render_flat_markdown(mp3_path.stem, text, meta)
             out_path.write_text(content, encoding="utf-8")
             print(f"    ✓ Saved: {out_path.name}")
 
@@ -1082,10 +1320,18 @@ def main():
     parser.add_argument("--model",  default="medium", help="Whisper model: tiny, base, small, medium, large-v3")
     parser.add_argument("--diarize", action=argparse.BooleanOptionalAction, default=None,
                         help="Force speaker diarization on/off (overrides feeds.toml)")
+    parser.add_argument("--backfill-headers", action="store_true",
+                        help="For existing transcripts, fetch each feed's RSS and splice "
+                             "metadata (title, link, summary, etc.) into the .md header. "
+                             "Skips files that already have YAML frontmatter.")
     args = parser.parse_args()
 
     config = load_config(Path(args.config))
     resolve_feed(args, config)
+
+    if args.backfill_headers:
+        run_backfill_headers(args)
+        return
 
     if args.transcribe:
         run_transcribe(args)

@@ -130,6 +130,7 @@ For episodes Substack already provides a transcript for (not all do):
 | `--out DIR` | `./<kind>/<feed-tag>/` | Output directory override |
 | `--limit N` | unlimited | Max entries to process. Overrides `max_downloads_per_run` from `feeds.toml`. |
 | `--no-limit` | | Bypass `max_downloads_per_run` from `feeds.toml`. Useful for bulk pre-downloads on an unmetered network when you'll be processing the audio later at home. Conflicts with `--limit`; if both are given, `--limit` wins. |
+| `--backfill-headers` | | Splice RSS-derived metadata (title, link, summary, etc.) into existing transcripts that don't yet have YAML frontmatter. Idempotent. Use with `--feed <tag>` to scope to one feed. |
 | `--model SIZE` | `medium` | `tiny`, `base`, `small`, `medium`, `large-v3` |
 | `--mp3-dir DIR` | derived from `--feed` | mp3 source for `--transcribe` |
 | `--transcript-dir DIR` | derived from `--feed` | Checked by `--download` to skip already-transcribed episodes |
@@ -191,6 +192,46 @@ One-time setup:
 Diarization runs alongside Whisper — net wall-clock is roughly 2× the transcribe-only time. Speaker labels are generic (`A`, `B`, …) per-episode; they do not carry across episodes.
 
 For one-off testing, `--diarize` / `--no-diarize` on the CLI overrides whatever's in `feeds.toml`.
+
+## Episode metadata in transcripts
+
+Each transcript opens with YAML frontmatter (Obsidian-friendly) plus a visible markdown header carrying the episode's title, show, host, link, duration, and full description from the RSS feed:
+
+```
+---
+title: "FFmpeg: The Incredible Technology Behind Video on the Internet"
+date: 2026-05-06
+show: Lex Fridman Podcast
+host: Lex Fridman
+link: https://lexfridman.com/ffmpeg/
+duration: 4:23:41
+guid: https://lexfridman.com/?p=6450
+---
+
+# FFmpeg: The Incredible Technology Behind Video on the Internet
+
+> Jean-Baptiste Kempf is lead developer of VLC and president of VideoLAN…
+
+[Show notes](https://lexfridman.com/ffmpeg/)
+
+---
+
+**Speaker A** (00:00):
+…
+```
+
+**How the data flows**: `--download` writes a `<stem>.meta.json` sidecar next to the mp3 (~500 bytes). `--transcribe` reads the sidecar and renders the header. The sidecar is removed when the mp3 is evicted (the metadata is permanent inside the transcript by then).
+
+### Backfilling old transcripts
+
+```bash
+./run.sh --backfill-headers              # all feeds
+./run.sh --backfill-headers --feed lex-fridman
+```
+
+Walks each feed's RSS and splices the metadata header into existing `.md` files that don't already have YAML frontmatter. Idempotent — re-running is a no-op for files that already have headers. Files whose stem doesn't appear in the current RSS feed (rotated out, renamed) are skipped with a count.
+
+After backfill, the SD card transcripts get refreshed automatically via the mtime-aware backup logic.
 
 ## How dedup works (`.processed`)
 
