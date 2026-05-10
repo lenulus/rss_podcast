@@ -60,6 +60,7 @@ These can be set under `[defaults]` (applies to every feed) or under `[feeds.<ta
 | `max_downloads_per_run` | Default cap for `--download` and the transcript-fetch path in a single run. Overridden by an explicit `--limit N` or bypassed entirely with `--no-limit`. |
 | `download_order` | `"newest"` (default) or `"oldest"`. Use `"oldest"` for incremental backfill of an archive. |
 | `diarize` | `true` runs speaker diarization (pyannote.audio) during `--transcribe`. The `.md` output gains `**Speaker A** (mm:ss):` headers per turn. Adds runtime and a one-time HuggingFace setup; opt-in per feed. |
+| `daily` | Defaults to `true`. Set `daily = false` to exclude this feed from the `--daily` macro (the feed remains usable via explicit `--feed <tag> --download` / `--transcribe`). |
 | `whisper_batch_size` | Lightning Whisper MLX batch size (default `12`). Lower it (e.g. `6`) for very long episodes (3+ hours) that trip Metal GPU command-buffer timeouts. Tradeoff: ~linear slowdown. |
 | `host` | Override the RSS-derived host name. Used for diarization speaker-naming (most-talked speaker in first 60s renders as `**<first-name>**` instead of `Speaker A`). Defaults to whatever the feed's `itunes_author` says. |
 
@@ -134,6 +135,7 @@ For episodes Substack already provides a transcript for (not all do):
 | `--backfill-headers` | | Splice RSS-derived metadata (title, link, summary, etc.) into existing transcripts that don't yet have YAML frontmatter. Idempotent. Use with `--feed <tag>` to scope to one feed. |
 | `--status` | | Print a per-feed health snapshot (RSS count, local mp3s, transcribed, SD card mp3s/transcripts, orphan mp3s without transcripts, headerless transcripts). Combine with `--offline` to skip the RSS fetch. |
 | `--check` | | List new episodes per feed (in RSS but not in `.processed`), including byte sizes when the feed publishes them. Doesn't download anything — RSS fetch only. Cheap enough for cron / metered connections. Use with `--feed <tag>` to scope. |
+| `--daily` | | Run `--download` then `--transcribe` for every feed not opted out with `daily = false`. Per-feed errors don't block the rest of the routine. Combine with `--feed <tag>` to scope to one feed. |
 | `--model SIZE` | `medium` | `tiny`, `base`, `small`, `medium`, `large-v3` |
 | `--mp3-dir DIR` | derived from `--feed` | mp3 source for `--transcribe` |
 | `--transcript-dir DIR` | derived from `--feed` | Checked by `--download` to skip already-transcribed episodes |
@@ -153,20 +155,23 @@ Speed estimates are approximate on an M1 MacBook Pro.
 ## Typical workflow
 
 ```bash
-# 1. Set up
+# 1. Set up (once)
 ./setup.sh
-cp feeds.example.toml feeds.toml      # edit with your RSS URL
+cp feeds.example.toml feeds.toml      # edit with your RSS URLs
 
 # 2. Browse what's available
 ./run.sh --feed nates-notebook --index
 
-# 3. Download all episodes
-./run.sh --feed nates-notebook --download
+# 3. Daily routine — download + transcribe every active feed
+./run.sh --daily
 
-# 4. Transcribe everything across every feed (runs overnight for large archives)
-./run.sh --transcribe
+# 4. Pre-flight check on a metered connection (no audio fetched)
+./run.sh --check
 
-# 5. Search transcripts
+# 5. See how everything's wired
+./run.sh --status
+
+# 6. Search transcripts
 grep -rl "context engineering" ./transcripts/
 ```
 

@@ -59,6 +59,11 @@ rss = "https://api.substack.com/feed/podcast/XXXXXX/private-key.rss"
 # of "Speaker A". Defaults to itunes_author from the RSS channel.
 # host = "Lex Fridman"
 
+# Opt this feed out of the --daily macro (download + transcribe). Defaults
+# to true. Useful for archived shows you keep configured for backfill but
+# don't actively follow.
+# daily = false
+
 # Lightning Whisper MLX batch size (default 12). Lower this for very long
 # episodes (3 + hours) that trip Metal GPU command-buffer timeouts —
 # smaller batches mean smaller per-op GPU work. Costs roughly proportional

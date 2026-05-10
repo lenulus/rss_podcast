@@ -1382,6 +1382,75 @@ def run_status(args):
     print("  No-hdr  = local transcripts without YAML frontmatter (run --backfill-headers)")
 
 
+def run_daily(args):
+    """Download → transcribe for every feed (unless opted out via daily = false).
+
+    Two phases:
+      1. Downloads — each feed's mp3s pulled in turn; per-feed errors don't
+         block other feeds.
+      2. Transcribes — each feed processed individually so non-daily feeds
+         don't accidentally pick up pending mp3s sitting in their dirs.
+
+    Per-feed `daily = false` in feeds.toml opts a feed out (e.g. an archived
+    show you don't actively follow but want kept in the config for backfill).
+    Passing --feed <tag> alongside --daily limits the routine to that one
+    feed, ignoring the daily attribute.
+    """
+    config = getattr(args, "_config", {}) or {}
+    feeds = config.get("feeds", {})
+
+    if args.feed:
+        selected = [args.feed] if args.feed in feeds else []
+    else:
+        selected = [t for t in feeds if feed_cfg_for(config, t).get("daily", True)]
+        skipped = [t for t in feeds if not feed_cfg_for(config, t).get("daily", True)]
+        if skipped:
+            print(f"Skipping (daily = false): {', '.join(skipped)}")
+
+    if not selected:
+        print("No feeds eligible for the daily routine.")
+        return
+
+    print(f"Daily routine: {', '.join(selected)}")
+
+    # Phase 1 — downloads. Per-feed errors do not abort the loop.
+    print("\n=== Phase 1: download ===")
+    for tag in selected:
+        cfg = feed_cfg_for(config, tag)
+        rss = cfg.get("rss")
+        if not rss:
+            print(f"\n[{tag}] no rss configured — skipping download")
+            continue
+        print(f"\n--- [{tag}] ---")
+        args.feed = tag
+        args._feed_cfg = cfg
+        args.rss = rss
+        args.sid = args.sid or cfg.get("sid")
+        try:
+            feed = feedparser.parse(rss)
+            if not feed.entries:
+                print("  ↷ no entries in RSS")
+                continue
+            run_download(feed, args)
+        except Exception as e:
+            print(f"  ✗ download error: {e}")
+
+    # Phase 2 — transcribes. One feed at a time so each gets its own
+    # checkpoint dir + per-feed diarization config + host name.
+    print("\n=== Phase 2: transcribe ===")
+    for tag in selected:
+        cfg = feed_cfg_for(config, tag)
+        print(f"\n--- [{tag}] ---")
+        args.feed = tag
+        args._feed_cfg = cfg
+        try:
+            run_transcribe(args)
+        except Exception as e:
+            print(f"  ✗ transcribe error: {e}")
+
+    print("\nDaily routine complete.")
+
+
 def run_check(args):
     """List new episodes per feed without downloading anything.
 
@@ -1770,6 +1839,11 @@ def main():
     parser.add_argument("--check", action="store_true",
                         help="List new episodes per feed without downloading. "
                              "Lightweight enough for cron / metered connections.")
+    parser.add_argument("--daily", action="store_true",
+                        help="Run --download then --transcribe for every feed that hasn't "
+                             "opted out with `daily = false` in feeds.toml. Per-feed errors "
+                             "don't block the rest of the routine. With --feed <tag>, "
+                             "scopes the routine to that one feed.")
     args = parser.parse_args()
 
     config = load_config(Path(args.config))
@@ -1781,6 +1855,10 @@ def main():
 
     if args.check:
         run_check(args)
+        return
+
+    if args.daily:
+        run_daily(args)
         return
 
     if args.backfill_headers:
