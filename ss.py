@@ -233,6 +233,49 @@ def get_audio_duration_secs(mp3_path: Path) -> float | None:
         return None
 
 
+# ── Whisper repetition-loop cleanup ───────────────────────────────────────────
+#
+# Whisper occasionally gets stuck producing the same sentence over and over —
+# especially during silence, music, or sponsor breaks. These aren't hallucinated
+# content (the words are real), they're decoder loops. We collapse runs of N+
+# consecutive identical sentences to a single occurrence. Threshold of 3
+# preserves legitimate doubled phrases ("Yes. Yes.") while killing the loops.
+
+REPETITION_THRESHOLD = 3
+
+
+def _normalize_for_compare(s: str) -> str:
+    """Lowercase, strip, collapse internal whitespace — for run detection only."""
+    return re.sub(r"\s+", " ", s.lower().strip())
+
+
+def collapse_repetitions(text: str, threshold: int = REPETITION_THRESHOLD) -> str:
+    """Collapse runs of `threshold`+ consecutive identical sentences to one.
+
+    Splits on sentence-terminal punctuation followed by whitespace. Comparison
+    is case- and whitespace-insensitive but punctuation-sensitive (a sentence
+    ending in '?' is not equivalent to one ending in '.'). Preserves the
+    original first occurrence verbatim.
+    """
+    if not text:
+        return text
+    sentences = re.split(r"(?<=[.!?])\s+", text)
+    out: list[str] = []
+    i = 0
+    while i < len(sentences):
+        j = i
+        norm_i = _normalize_for_compare(sentences[i])
+        while j + 1 < len(sentences) and _normalize_for_compare(sentences[j + 1]) == norm_i:
+            j += 1
+        run = j - i + 1
+        if run >= threshold:
+            out.append(sentences[i])
+        else:
+            out.extend(sentences[i:j + 1])
+        i = j + 1
+    return " ".join(out)
+
+
 # ── Diarization ───────────────────────────────────────────────────────────────
 #
 # Speaker diarization runs alongside Whisper for feeds with `diarize = true`.
@@ -381,7 +424,8 @@ def render_diarized_markdown(stem: str, aligned: list[dict]) -> str:
             label = humanize_speaker(current_speaker)
             ts = format_timestamp(block_start)
             lines.append(f"**Speaker {label}** ({ts}):")
-            lines.append(" ".join(s.strip() for s in buffer if s.strip()))
+            joined = " ".join(s.strip() for s in buffer if s.strip())
+            lines.append(collapse_repetitions(joined))
             lines.append("")
 
     for seg in aligned:
@@ -610,9 +654,19 @@ def backup_feed_transcripts(tag: str, feed_cfg: dict) -> None:
         return
 
     copied = 0
+    refreshed = 0
     for md in md_files:
         dest = text_dir / md.name
         if dest.exists():
+            # Skip only if the backup is at least as fresh as the local file.
+            # shutil.copy2 preserves mtime, so post-copy the two match exactly.
+            if dest.stat().st_mtime >= md.stat().st_mtime:
+                continue
+            try:
+                shutil.copy2(md, dest)
+                refreshed += 1
+            except OSError as e:
+                print(f"  ✗ [{tag}] transcript refresh failed for {md.name}: {e}")
             continue
         try:
             shutil.copy2(md, dest)
@@ -620,8 +674,13 @@ def backup_feed_transcripts(tag: str, feed_cfg: dict) -> None:
         except OSError as e:
             print(f"  ✗ [{tag}] transcript backup failed for {md.name}: {e}")
 
-    if copied:
-        print(f"  [{tag}] Backed up {copied} new transcript(s) → {text_dir}")
+    if copied or refreshed:
+        parts = []
+        if copied:
+            parts.append(f"{copied} new")
+        if refreshed:
+            parts.append(f"{refreshed} updated")
+        print(f"  [{tag}] Backed up {' + '.join(parts)} transcript(s) → {text_dir}")
 
 
 # ── Eviction ──────────────────────────────────────────────────────────────────
@@ -981,7 +1040,8 @@ def run_transcribe(args):
             else:
                 if do_diarize and not segments:
                     print(f"    ⚠ Whisper returned no segments — saving flat transcript.")
-                content = f"# {mp3_path.stem}\n\n---\n\n{text}\n"
+                cleaned = collapse_repetitions(text)
+                content = f"# {mp3_path.stem}\n\n---\n\n{cleaned}\n"
             out_path.write_text(content, encoding="utf-8")
             print(f"    ✓ Saved: {out_path.name}")
 
