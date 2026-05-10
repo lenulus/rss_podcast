@@ -59,6 +59,8 @@ These can be set under `[defaults]` (applies to every feed) or under `[feeds.<ta
 | `transcript_dir` | Override where this feed's transcript backups land. Absolute path. If set, replaces `<backup_path>/<tag>/text/`. |
 | `max_downloads_per_run` | Default cap for `--download` and the transcript-fetch path in a single run. Overridden by an explicit `--limit`. |
 | `download_order` | `"newest"` (default) or `"oldest"`. Use `"oldest"` for incremental backfill of an archive. |
+| `diarize` | `true` runs speaker diarization (pyannote.audio) during `--transcribe`. The `.md` output gains `**Speaker A** (mm:ss):` headers per turn. Adds runtime and a one-time HuggingFace setup; opt-in per feed. |
+| `whisper_batch_size` | Lightning Whisper MLX batch size (default `12`). Lower it (e.g. `6`) for very long episodes (3+ hours) that trip Metal GPU command-buffer timeouts. Tradeoff: ~linear slowdown. |
 
 ## Usage
 
@@ -166,6 +168,28 @@ grep -rl "context engineering" ./transcripts/
 ## Output format
 
 Transcripts are saved as Markdown files named `YYYY-MM-DD - Episode Title.md` under `./transcripts/<feed-tag>/`. Downloaded mp3s use the same naming under `./downloads/<feed-tag>/`.
+
+## Speaker diarization (optional)
+
+For multi-speaker feeds (interviews, panels), set `diarize = true` on that feed in `feeds.toml` and `--transcribe` will emit speaker-labeled markdown:
+
+```
+**Speaker A** (00:00:00):
+…opening…
+
+**Speaker B** (00:01:42):
+…response…
+```
+
+One-time setup:
+
+1. `.venv/bin/pip install pyannote.audio torchaudio` (~3 GB).
+2. Make a HuggingFace account, accept the license at <https://huggingface.co/pyannote/speaker-diarization-3.1>.
+3. Run `huggingface-cli login` and paste your access token.
+
+Diarization runs alongside Whisper — net wall-clock is roughly 2× the transcribe-only time. Speaker labels are generic (`A`, `B`, …) per-episode; they do not carry across episodes.
+
+For one-off testing, `--diarize` / `--no-diarize` on the CLI overrides whatever's in `feeds.toml`.
 
 ## How dedup works (`.processed`)
 

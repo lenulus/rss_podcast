@@ -233,6 +233,264 @@ def get_audio_duration_secs(mp3_path: Path) -> float | None:
         return None
 
 
+# ── Diarization ───────────────────────────────────────────────────────────────
+#
+# Speaker diarization runs alongside Whisper for feeds with `diarize = true`.
+# Pipeline is lazy-loaded — pyannote.audio is only imported when at least one
+# feed in the run actually needs it.
+
+def load_diarization_pipeline():
+    """Load pyannote/speaker-diarization-3.1, moving it to MPS if available."""
+    try:
+        from pyannote.audio import Pipeline
+        import torch
+    except ImportError as e:
+        sys.exit(
+            f"Diarization requested but pyannote.audio isn't installed: {e}\n"
+            "Install with: .venv/bin/pip install pyannote.audio torchaudio"
+        )
+    try:
+        pipeline = Pipeline.from_pretrained("pyannote/speaker-diarization-3.1")
+    except Exception as e:
+        sys.exit(
+            f"Failed to load pyannote/speaker-diarization-3.1: {e}\n"
+            "Make sure you've accepted the license at "
+            "https://huggingface.co/pyannote/speaker-diarization-3.1 and "
+            "run `huggingface-cli login`."
+        )
+    if pipeline is None:
+        sys.exit("Pipeline loaded as None — check HuggingFace auth.")
+    if torch.backends.mps.is_available():
+        pipeline.to(torch.device("mps"))
+    return pipeline
+
+
+def diarize_audio(mp3_path: Path, pipeline) -> list[tuple[float, float, str]]:
+    """Return [(start_seconds, end_seconds, speaker_label), …].
+
+    Pre-converts the mp3 to a 16 kHz mono WAV via ffmpeg before feeding it to
+    pyannote — mp3 frame quantization causes occasional sample-count mismatches
+    in pyannote's internal chunker (~25 ms shortfalls). WAV avoids the issue.
+    """
+    import subprocess
+    import tempfile
+    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
+        wav_path = tmp.name
+    try:
+        subprocess.run(
+            ["ffmpeg", "-y", "-loglevel", "error", "-i", str(mp3_path),
+             "-ar", "16000", "-ac", "1", wav_path],
+            check=True,
+        )
+        diarization = pipeline(wav_path)
+        # pyannote 4.x returns DiarizeOutput; the inner Annotation lives at
+        # .exclusive_speaker_diarization (non-overlapping turns, which is what
+        # our segment-midpoint alignment expects).
+        annotation = getattr(diarization, "exclusive_speaker_diarization", None) \
+            or getattr(diarization, "speaker_diarization", diarization)
+        return [(turn.start, turn.end, speaker)
+                for turn, _, speaker in annotation.itertracks(yield_label=True)]
+    finally:
+        Path(wav_path).unlink(missing_ok=True)
+
+
+def humanize_speaker(label: str) -> str:
+    """SPEAKER_00 → 'A', SPEAKER_01 → 'B', etc. Other labels pass through."""
+    if label and label.startswith("SPEAKER_"):
+        try:
+            n = int(label[len("SPEAKER_"):])
+            if 0 <= n < 26:
+                return chr(ord("A") + n)
+        except ValueError:
+            pass
+    return label or "?"
+
+
+def format_timestamp(seconds: float) -> str:
+    """Seconds → 'MM:SS' or 'H:MM:SS'."""
+    s = int(seconds)
+    h, rem = divmod(s, 3600)
+    m, s = divmod(rem, 60)
+    return f"{h}:{m:02d}:{s:02d}" if h else f"{m:02d}:{s:02d}"
+
+
+def _segment_fields(seg) -> tuple[float, float, str] | None:
+    """Normalize a Whisper segment into (start_seconds, end_seconds, text).
+
+    Handles both shapes seen in the wild:
+    - dict-style (openai-whisper): {"start": 0.0, "end": 3.2, "text": "..."}
+    - list-style (lightning_whisper_mlx): [start_centiseconds, end_centiseconds, text]
+    """
+    if isinstance(seg, dict):
+        text = (seg.get("text") or "").strip()
+        if not text:
+            return None
+        return float(seg.get("start", 0.0)), float(seg.get("end", 0.0)), text
+    if isinstance(seg, (list, tuple)) and len(seg) >= 3:
+        text = str(seg[2]).strip()
+        if not text:
+            return None
+        # lightning_whisper_mlx uses centiseconds (start * 100, end * 100).
+        return float(seg[0]) / 100.0, float(seg[1]) / 100.0, text
+    return None
+
+
+def align_segments_to_speakers(segments: list, turns: list) -> list[dict]:
+    """Tag each Whisper segment with the speaker whose turn contains its midpoint.
+
+    Falls back to the speaker with the largest temporal overlap when no turn
+    covers the midpoint exactly.
+    """
+    aligned = []
+    for seg in segments:
+        fields = _segment_fields(seg)
+        if fields is None:
+            continue
+        start, end, text = fields
+        midpoint = (start + end) / 2
+
+        speaker = None
+        for t_start, t_end, t_speaker in turns:
+            if t_start <= midpoint <= t_end:
+                speaker = t_speaker
+                break
+        if speaker is None:
+            best_overlap = 0.0
+            for t_start, t_end, t_speaker in turns:
+                overlap = max(0.0, min(end, t_end) - max(start, t_start))
+                if overlap > best_overlap:
+                    best_overlap = overlap
+                    speaker = t_speaker
+        aligned.append({"start": start, "end": end, "text": text,
+                        "speaker": speaker or "Unknown"})
+    return aligned
+
+
+def render_diarized_markdown(stem: str, aligned: list[dict]) -> str:
+    """Render aligned segments with **Speaker X** (mm:ss): headers per turn."""
+    if not aligned:
+        return f"# {stem}\n\n---\n\n(no segments produced)\n"
+
+    lines = [f"# {stem}", "", "---", ""]
+    current_speaker = None
+    block_start = 0.0
+    buffer: list[str] = []
+
+    def flush():
+        if buffer and current_speaker is not None:
+            label = humanize_speaker(current_speaker)
+            ts = format_timestamp(block_start)
+            lines.append(f"**Speaker {label}** ({ts}):")
+            lines.append(" ".join(s.strip() for s in buffer if s.strip()))
+            lines.append("")
+
+    for seg in aligned:
+        if seg["speaker"] != current_speaker:
+            flush()
+            current_speaker = seg["speaker"]
+            block_start = seg["start"]
+            buffer = []
+        buffer.append(seg["text"])
+    flush()
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def should_diarize(args, feed_cfg: dict) -> bool:
+    """CLI override wins; otherwise read TOML."""
+    if getattr(args, "diarize", None) is not None:
+        return bool(args.diarize)
+    return bool(feed_cfg.get("diarize", False))
+
+
+def diarize_cache_path(mp3_path: Path, transcript_dir: Path) -> Path:
+    """Sidecar location for cached pyannote turns."""
+    return transcript_dir / ".diarize" / f"{mp3_path.stem}.json"
+
+
+def load_cached_diarization(mp3_path: Path, transcript_dir: Path) -> list[tuple[float, float, str]] | None:
+    """Return cached turns if the sidecar exists and is newer than the mp3."""
+    import json
+    cache = diarize_cache_path(mp3_path, transcript_dir)
+    if not cache.exists():
+        return None
+    if cache.stat().st_mtime < mp3_path.stat().st_mtime:
+        return None  # mp3 changed since we cached
+    try:
+        data = json.loads(cache.read_text(encoding="utf-8"))
+        return [(float(t[0]), float(t[1]), str(t[2])) for t in data]
+    except Exception:
+        return None
+
+
+def save_diarization_cache(mp3_path: Path, transcript_dir: Path,
+                           turns: list[tuple[float, float, str]]) -> None:
+    """Persist diarization turns as a JSON sidecar so future retries skip the work."""
+    import json
+    cache = diarize_cache_path(mp3_path, transcript_dir)
+    cache.parent.mkdir(parents=True, exist_ok=True)
+    cache.write_text(json.dumps([[t[0], t[1], t[2]] for t in turns]), encoding="utf-8")
+
+
+# ── Whisper chunked transcription ─────────────────────────────────────────────
+#
+# MLX/Metal trips a GPU command-buffer timeout on multi-hour audio (the mel
+# spectrogram step generates a single tensor op longer than the system limit).
+# Splitting the audio into ~30-minute chunks via ffmpeg avoids the issue.
+# Each chunk transcribes independently; segment timestamps are offset by the
+# chunk's start before being merged.
+
+CHUNK_SECONDS_DEFAULT = 1800  # 30 minutes
+
+
+def transcribe_chunked(mp3_path: Path, whisper, chunk_seconds: int = CHUNK_SECONDS_DEFAULT) -> dict:
+    """Transcribe a long mp3 by ffmpeg-slicing into chunks, then merging.
+
+    For files at or below `chunk_seconds`, this is a single pass — no slicing.
+    Otherwise it streams chunks through `whisper.transcribe` and stitches the
+    results, adjusting segment timestamps by each chunk's start offset.
+    """
+    duration = get_audio_duration_secs(mp3_path)
+    if duration is None or duration <= chunk_seconds:
+        return whisper.transcribe(audio_path=str(mp3_path))
+
+    import subprocess
+    import tempfile
+
+    n_chunks = int(duration // chunk_seconds) + (1 if duration % chunk_seconds > 0 else 0)
+    all_text: list[str] = []
+    all_segments: list = []
+
+    with tempfile.TemporaryDirectory(prefix="ss-chunks-") as tmpdir:
+        tmp = Path(tmpdir)
+        for i in range(n_chunks):
+            start = i * chunk_seconds
+            chunk_path = tmp / f"chunk_{i:03d}.mp3"
+            # `-ss` before `-i` seeks before reading — fast for mp3 stream copy.
+            subprocess.run([
+                "ffmpeg", "-y", "-loglevel", "error",
+                "-ss", str(start), "-i", str(mp3_path),
+                "-t", str(chunk_seconds), "-c", "copy",
+                str(chunk_path),
+            ], check=True)
+
+            print(f"    ↻ Chunk {i+1}/{n_chunks} @{format_timestamp(start)}")
+            result = whisper.transcribe(audio_path=str(chunk_path))
+            all_text.append((result.get("text") or "").strip())
+
+            # lightning_whisper_mlx returns [start_cs, end_cs, text] per segment.
+            offset_cs = int(start * 100)
+            for seg in result.get("segments") or []:
+                if isinstance(seg, (list, tuple)) and len(seg) >= 3:
+                    all_segments.append([seg[0] + offset_cs, seg[1] + offset_cs, seg[2]])
+                elif isinstance(seg, dict):
+                    s = dict(seg)
+                    s["start"] = float(seg.get("start", 0)) + start
+                    s["end"] = float(seg.get("end", 0)) + start
+                    all_segments.append(s)
+
+    return {"text": " ".join(all_text), "segments": all_segments}
+
+
 # ── Path resolution ───────────────────────────────────────────────────────────
 
 def default_dir(kind: str, tag: str | None) -> Path:
@@ -286,14 +544,17 @@ def record_processed(tag: str, stem: str) -> None:
 
 # ── Backup paths ──────────────────────────────────────────────────────────────
 
-def _ensure_backup_dir(target: Path, tag: str, label: str) -> Path | None:
+def _ensure_backup_dir(target: Path, root: Path, tag: str, label: str) -> Path | None:
     """Make sure a backup directory is reachable. Returns the dir or None on failure.
 
-    'Reachable' means the directory or its parent exists — protects against
-    silently writing into a path whose mountpoint (e.g. SD card) is gone.
+    Reachability is checked against the user-configured `root` (backup_path or
+    explicit media_dir/transcript_dir), not against `target`'s parent — so a
+    brand-new feed can have its tag subdir created on first use without tripping
+    the unmounted-volume guard. The guard still fires when the configured root
+    (or its parent — e.g. /Volumes/SD when the card is missing) doesn't exist.
     """
-    if not target.exists() and not target.parent.is_dir():
-        print(f"  ⚠ [{tag}] {label} path {target} unavailable (parent missing) — skipping.")
+    if not root.exists() and not root.parent.is_dir():
+        print(f"  ⚠ [{tag}] {label} root {root} unavailable (parent missing) — skipping.")
         return None
     try:
         target.mkdir(parents=True, exist_ok=True)
@@ -307,22 +568,26 @@ def resolve_media_dir(tag: str, feed_cfg: dict) -> Path | None:
     """Where evicted mp3s back up to. Returns None if no backup is configured."""
     explicit = feed_cfg.get("media_dir")
     if explicit:
-        return _ensure_backup_dir(Path(explicit), tag, "media_dir")
+        target = Path(explicit)
+        return _ensure_backup_dir(target, target, tag, "media_dir")
     backup_path = feed_cfg.get("backup_path")
     if not backup_path:
         return None
-    return _ensure_backup_dir(Path(backup_path) / tag / "media", tag, "media")
+    root = Path(backup_path)
+    return _ensure_backup_dir(root / tag / "media", root, tag, "media")
 
 
 def resolve_transcript_dir(tag: str, feed_cfg: dict) -> Path | None:
     """Where transcript backups land. Returns None if no backup is configured."""
     explicit = feed_cfg.get("transcript_dir")
     if explicit:
-        return _ensure_backup_dir(Path(explicit), tag, "transcript_dir")
+        target = Path(explicit)
+        return _ensure_backup_dir(target, target, tag, "transcript_dir")
     backup_path = feed_cfg.get("backup_path")
     if not backup_path:
         return None
-    return _ensure_backup_dir(Path(backup_path) / tag / "text", tag, "text")
+    root = Path(backup_path)
+    return _ensure_backup_dir(root / tag / "text", root, tag, "text")
 
 
 # ── Transcript backup ─────────────────────────────────────────────────────────
@@ -600,19 +865,26 @@ def run_transcribe(args):
 
     # Pre-scan to figure out how many files we'd process — lets us skip model load if zero.
     plan: list[tuple[Path, Path, list[Path]]] = []
+    pair_diarize: dict[str, bool] = {}
+    pair_batch: dict[str, int] = {}
     for mp3_dir, out_dir in pairs:
         if not mp3_dir.is_dir():
             print(f"  ↷ Skip {mp3_dir}: not a directory.")
             continue
         mp3s = sorted(mp3_dir.glob("*.mp3"))
         tag = mp3_dir.name
-        if feed_cfg_for(config, tag):
+        feed_cfg = feed_cfg_for(config, tag)
+        if feed_cfg:
             existing = load_processed(tag)
         else:
             existing = {p.stem for p in out_dir.glob("*.md")} if out_dir.is_dir() else set()
         to_process = [f for f in mp3s if f.stem not in existing]
         plan.append((mp3_dir, out_dir, to_process))
-        print(f"  {mp3_dir}: {len(mp3s)} mp3(s), {len(existing)} transcribed, {len(to_process)} pending → {out_dir}")
+        pair_diarize[tag] = should_diarize(args, feed_cfg)
+        pair_batch[tag] = int(feed_cfg.get("whisper_batch_size", 12))
+        diar_marker = "  ✦ diarize" if pair_diarize[tag] else ""
+        batch_marker = f"  batch={pair_batch[tag]}" if pair_batch[tag] != 12 else ""
+        print(f"  {mp3_dir}: {len(mp3s)} mp3(s), {len(existing)} transcribed, {len(to_process)} pending → {out_dir}{diar_marker}{batch_marker}")
 
     def post_process(mp3_dir: Path):
         """Run transcript backup + mp3 pruning for a finished feed dir."""
@@ -631,9 +903,14 @@ def run_transcribe(args):
         return
 
     print(f"\nDevice: Apple Silicon GPU (MLX)")
-    print(f"Loading model '{args.model}'...")
     from lightning_whisper_mlx import LightningWhisperMLX
-    whisper = LightningWhisperMLX(model=args.model, batch_size=12, quant=None)
+    whisper = None
+    last_batch: int | None = None
+
+    diarization_pipeline = None
+    if any(pair_diarize.values()):
+        print("Loading diarization pipeline (pyannote)...")
+        diarization_pipeline = load_diarization_pipeline()
 
     total_done = 0
 
@@ -642,6 +919,13 @@ def run_transcribe(args):
             post_process(mp3_dir)
             continue
         out_dir.mkdir(parents=True, exist_ok=True)
+
+        desired_batch = pair_batch.get(mp3_dir.name, 12)
+        if whisper is None or last_batch != desired_batch:
+            print(f"Loading model '{args.model}' (batch_size={desired_batch})...")
+            whisper = LightningWhisperMLX(model=args.model, batch_size=desired_batch, quant=None)
+            last_batch = desired_batch
+
         print(f"\n[{mp3_dir}] {len(to_process)} mp3(s) → {out_dir}")
 
         for i, mp3_path in enumerate(to_process, 1):
@@ -653,10 +937,31 @@ def run_transcribe(args):
 
             audio_dur = get_audio_duration_secs(mp3_path)
             dur_str = format_duration(str(int(audio_dur))) if audio_dur else "??:??"
-            print(f"  [{i}/{len(to_process)}] Transcribing ({dur_str}): {mp3_path.name}")
+            do_diarize = pair_diarize.get(mp3_dir.name, False) and diarization_pipeline is not None
+            mode_marker = " (with diarization)" if do_diarize else ""
+            print(f"  [{i}/{len(to_process)}] Transcribing{mode_marker} ({dur_str}): {mp3_path.name}")
+
+            speaker_turns = None
+            if do_diarize:
+                cached = load_cached_diarization(mp3_path, out_dir)
+                if cached is not None:
+                    speaker_turns = cached
+                    n_speakers = len(set(t[2] for t in speaker_turns))
+                    print(f"    ✓ Diarization (cached) — {n_speakers} speaker(s), {len(speaker_turns)} turn(s)")
+                else:
+                    t_d = time.time()
+                    try:
+                        speaker_turns = diarize_audio(mp3_path, diarization_pipeline)
+                    except Exception as e:
+                        print(f"    ✗ Diarization failed: {e} — falling back to flat transcript.")
+                        speaker_turns = None
+                    else:
+                        n_speakers = len(set(t[2] for t in speaker_turns))
+                        print(f"    ✓ Diarized in {time.time() - t_d:.1f}s — {n_speakers} speaker(s), {len(speaker_turns)} turn(s)")
+                        save_diarization_cache(mp3_path, out_dir, speaker_turns)
 
             t0 = time.time()
-            result = whisper.transcribe(audio_path=str(mp3_path))
+            result = transcribe_chunked(mp3_path, whisper)
             elapsed = time.time() - t0
             text = result["text"].strip()
 
@@ -669,7 +974,15 @@ def run_transcribe(args):
             print(f"    ✓ {words} words in {elapsed:.1f}s ({speed:.1f}x realtime)")
 
             out_path = out_dir / f"{mp3_path.stem}.md"
-            out_path.write_text(f"# {mp3_path.stem}\n\n---\n\n{text}\n", encoding="utf-8")
+            segments = result.get("segments") or []
+            if speaker_turns and segments:
+                aligned = align_segments_to_speakers(segments, speaker_turns)
+                content = render_diarized_markdown(mp3_path.stem, aligned)
+            else:
+                if do_diarize and not segments:
+                    print(f"    ⚠ Whisper returned no segments — saving flat transcript.")
+                content = f"# {mp3_path.stem}\n\n---\n\n{text}\n"
+            out_path.write_text(content, encoding="utf-8")
             print(f"    ✓ Saved: {out_path.name}")
 
             tag = mp3_dir.name
@@ -699,6 +1012,8 @@ def main():
     parser.add_argument("--mp3-dir", default=None, help="Directory containing mp3s to transcribe")
     parser.add_argument("--transcript-dir", default=None, help="Transcript dir checked by --download to skip already-transcribed episodes")
     parser.add_argument("--model",  default="medium", help="Whisper model: tiny, base, small, medium, large-v3")
+    parser.add_argument("--diarize", action=argparse.BooleanOptionalAction, default=None,
+                        help="Force speaker diarization on/off (overrides feeds.toml)")
     args = parser.parse_args()
 
     config = load_config(Path(args.config))

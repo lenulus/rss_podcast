@@ -2,3 +2,7 @@ feedparser
 requests
 lightning-whisper-mlx
 tomli; python_version < "3.11"
+
+# Optional — only needed when a feed has `diarize = true` in feeds.toml.
+# Pulls in torch + torchaudio (~3 GB).
+pyannote.audio

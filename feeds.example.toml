@@ -45,6 +45,20 @@ rss = "https://api.substack.com/feed/podcast/XXXXXX/private-key.rss"
 # Use "oldest" for incremental backfill of an archive.
 # download_order = "newest"   # or "oldest"
 
+# Enable speaker diarization for this feed. Adds a pyannote pass over each
+# mp3 during --transcribe and emits "**Speaker A** (mm:ss):" headers per
+# turn in the .md output. Requires pyannote.audio installed and a HuggingFace
+# token with the pyannote/speaker-diarization-3.1 license accepted.
+# Useful for interview / panel feeds; leave off for monologue feeds —
+# diarizing a single-speaker recording adds runtime and noisy headers.
+# diarize = true
+
+# Lightning Whisper MLX batch size (default 12). Lower this for very long
+# episodes (3 + hours) that trip Metal GPU command-buffer timeouts —
+# smaller batches mean smaller per-op GPU work. Costs roughly proportional
+# slowdown (batch=6 ≈ 2x slower than batch=12).
+# whisper_batch_size = 6
+
 # [feeds.another-feed]
 # rss = "https://api.substack.com/feed/podcast/YYYYYY/private-key.rss"
 # max_episodes_on_disk = 10
