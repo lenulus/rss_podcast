@@ -1671,6 +1671,7 @@ def run_transcribe(args):
     plan: list[tuple[Path, Path, list[Path]]] = []
     pair_diarize: dict[str, bool] = {}
     pair_batch: dict[str, int] = {}
+    pair_model: dict[str, str] = {}
     for mp3_dir, out_dir in pairs:
         if not mp3_dir.is_dir():
             print(f"  ↷ Skip {mp3_dir}: not a directory.")
@@ -1686,9 +1687,12 @@ def run_transcribe(args):
         plan.append((mp3_dir, out_dir, to_process))
         pair_diarize[tag] = should_diarize(args, feed_cfg)
         pair_batch[tag] = int(feed_cfg.get("whisper_batch_size", 12))
+        # CLI --model wins; otherwise per-feed `model`; otherwise default.
+        pair_model[tag] = args.model if args.model is not None else feed_cfg.get("model", "medium")
         diar_marker = "  ✦ diarize" if pair_diarize[tag] else ""
         batch_marker = f"  batch={pair_batch[tag]}" if pair_batch[tag] != 12 else ""
-        print(f"  {mp3_dir}: {len(mp3s)} mp3(s), {len(existing)} transcribed, {len(to_process)} pending → {out_dir}{diar_marker}{batch_marker}")
+        model_marker = f"  model={pair_model[tag]}" if pair_model[tag] != "medium" else ""
+        print(f"  {mp3_dir}: {len(mp3s)} mp3(s), {len(existing)} transcribed, {len(to_process)} pending → {out_dir}{diar_marker}{batch_marker}{model_marker}")
 
     def post_process(mp3_dir: Path):
         """Run transcript backup + mp3 pruning for a finished feed dir."""
@@ -1710,6 +1714,7 @@ def run_transcribe(args):
     from lightning_whisper_mlx import LightningWhisperMLX
     whisper = None
     last_batch: int | None = None
+    last_model: str | None = None
 
     diarization_pipeline = None
     if any(pair_diarize.values()):
@@ -1725,10 +1730,12 @@ def run_transcribe(args):
         out_dir.mkdir(parents=True, exist_ok=True)
 
         desired_batch = pair_batch.get(mp3_dir.name, 12)
-        if whisper is None or last_batch != desired_batch:
-            print(f"Loading model '{args.model}' (batch_size={desired_batch})...")
-            whisper = LightningWhisperMLX(model=args.model, batch_size=desired_batch, quant=None)
+        desired_model = pair_model.get(mp3_dir.name, "medium")
+        if whisper is None or last_batch != desired_batch or last_model != desired_model:
+            print(f"Loading model '{desired_model}' (batch_size={desired_batch})...")
+            whisper = LightningWhisperMLX(model=desired_model, batch_size=desired_batch, quant=None)
             last_batch = desired_batch
+            last_model = desired_model
 
         print(f"\n[{mp3_dir}] {len(to_process)} mp3(s) → {out_dir}")
 
@@ -1825,7 +1832,9 @@ def main():
     parser.add_argument("--transcribe", action="store_true", help="Transcribe mp3s using Whisper")
     parser.add_argument("--mp3-dir", default=None, help="Directory containing mp3s to transcribe")
     parser.add_argument("--transcript-dir", default=None, help="Transcript dir checked by --download to skip already-transcribed episodes")
-    parser.add_argument("--model",  default="medium", help="Whisper model: tiny, base, small, medium, large-v3")
+    parser.add_argument("--model",  default=None,
+                        help="Whisper model: tiny, base, small, medium (default), large-v3. "
+                             "Overrides per-feed `model` from feeds.toml when set.")
     parser.add_argument("--diarize", action=argparse.BooleanOptionalAction, default=None,
                         help="Force speaker diarization on/off (overrides feeds.toml)")
     parser.add_argument("--backfill-headers", action="store_true",

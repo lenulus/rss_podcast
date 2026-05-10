@@ -64,6 +64,12 @@ rss = "https://api.substack.com/feed/podcast/XXXXXX/private-key.rss"
 # don't actively follow.
 # daily = false
 
+# Per-feed Whisper model. Defaults to `medium`. Useful for feeds with
+# challenging audio (technical jargon, accents, music) — bump to
+# `large-v3` for higher accuracy at the cost of ~2x runtime. Other feeds
+# keep the default. CLI --model overrides when set.
+# model = "large-v3"
+
 # Lightning Whisper MLX batch size (default 12). Lower this for very long
 # episodes (3 + hours) that trip Metal GPU command-buffer timeouts —
 # smaller batches mean smaller per-op GPU work. Costs roughly proportional

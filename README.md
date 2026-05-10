@@ -62,6 +62,7 @@ These can be set under `[defaults]` (applies to every feed) or under `[feeds.<ta
 | `diarize` | `true` runs speaker diarization (pyannote.audio) during `--transcribe`. The `.md` output gains `**Speaker A** (mm:ss):` headers per turn. Adds runtime and a one-time HuggingFace setup; opt-in per feed. |
 | `daily` | Defaults to `true`. Set `daily = false` to exclude this feed from the `--daily` macro (the feed remains usable via explicit `--feed <tag> --download` / `--transcribe`). |
 | `whisper_batch_size` | Lightning Whisper MLX batch size (default `12`). Lower it (e.g. `6`) for very long episodes (3+ hours) that trip Metal GPU command-buffer timeouts. Tradeoff: ~linear slowdown. |
+| `model` | Whisper model size for this feed (`tiny`, `base`, `small`, `medium` (default), `large-v3`). Useful for boosting quality on tougher audio (technical jargon, accents, music-heavy ads) without slowing other feeds. CLI `--model` overrides when set. |
 | `host` | Override the RSS-derived host name. Used for diarization speaker-naming (most-talked speaker in first 60s renders as `**<first-name>**` instead of `Speaker A`). Defaults to whatever the feed's `itunes_author` says. |
 
 ## Usage
@@ -136,7 +137,7 @@ For episodes Substack already provides a transcript for (not all do):
 | `--status` | | Print a per-feed health snapshot (RSS count, local mp3s, transcribed, SD card mp3s/transcripts, orphan mp3s without transcripts, headerless transcripts). Combine with `--offline` to skip the RSS fetch. |
 | `--check` | | List new episodes per feed (in RSS but not in `.processed`), including byte sizes when the feed publishes them. Doesn't download anything — RSS fetch only. Cheap enough for cron / metered connections. Use with `--feed <tag>` to scope. |
 | `--daily` | | Run `--download` then `--transcribe` for every feed not opted out with `daily = false`. Per-feed errors don't block the rest of the routine. Combine with `--feed <tag>` to scope to one feed. |
-| `--model SIZE` | `medium` | `tiny`, `base`, `small`, `medium`, `large-v3` |
+| `--model SIZE` | `medium` (or per-feed `model`) | `tiny`, `base`, `small`, `medium`, `large-v3`. CLI flag overrides per-feed `model` in `feeds.toml` when set. |
 | `--mp3-dir DIR` | derived from `--feed` | mp3 source for `--transcribe` |
 | `--transcript-dir DIR` | derived from `--feed` | Checked by `--download` to skip already-transcribed episodes |
 
