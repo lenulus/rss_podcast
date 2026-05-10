@@ -57,7 +57,7 @@ These can be set under `[defaults]` (applies to every feed) or under `[feeds.<ta
 | `backup_path` | Root for backups. Mp3s back up to `<backup_path>/<tag>/media/<file>.mp3`; transcripts back up to `<backup_path>/<tag>/text/<file>.md`. If the path (or its parent — e.g. an unmounted SD card mount point) is missing, the affected backup is **skipped entirely** rather than risking unbacked deletion. |
 | `media_dir` | Override where this feed's mp3 backups land. Absolute path. If set, replaces `<backup_path>/<tag>/media/`. |
 | `transcript_dir` | Override where this feed's transcript backups land. Absolute path. If set, replaces `<backup_path>/<tag>/text/`. |
-| `max_downloads_per_run` | Default cap for `--download` and the transcript-fetch path in a single run. Overridden by an explicit `--limit`. |
+| `max_downloads_per_run` | Default cap for `--download` and the transcript-fetch path in a single run. Overridden by an explicit `--limit N` or bypassed entirely with `--no-limit`. |
 | `download_order` | `"newest"` (default) or `"oldest"`. Use `"oldest"` for incremental backfill of an archive. |
 | `diarize` | `true` runs speaker diarization (pyannote.audio) during `--transcribe`. The `.md` output gains `**Speaker A** (mm:ss):` headers per turn. Adds runtime and a one-time HuggingFace setup; opt-in per feed. |
 | `whisper_batch_size` | Lightning Whisper MLX batch size (default `12`). Lower it (e.g. `6`) for very long episodes (3+ hours) that trip Metal GPU command-buffer timeouts. Tradeoff: ~linear slowdown. |
@@ -128,7 +128,8 @@ For episodes Substack already provides a transcript for (not all do):
 | `--download` | | Download mp3 files instead of transcripts |
 | `--transcribe` | | Transcribe mp3s locally with Whisper |
 | `--out DIR` | `./<kind>/<feed-tag>/` | Output directory override |
-| `--limit N` | unlimited | Max entries to process |
+| `--limit N` | unlimited | Max entries to process. Overrides `max_downloads_per_run` from `feeds.toml`. |
+| `--no-limit` | | Bypass `max_downloads_per_run` from `feeds.toml`. Useful for bulk pre-downloads on an unmetered network when you'll be processing the audio later at home. Conflicts with `--limit`; if both are given, `--limit` wins. |
 | `--model SIZE` | `medium` | `tiny`, `base`, `small`, `medium`, `large-v3` |
 | `--mp3-dir DIR` | derived from `--feed` | mp3 source for `--transcribe` |
 | `--transcript-dir DIR` | derived from `--feed` | Checked by `--download` to skip already-transcribed episodes |

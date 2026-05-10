@@ -38,7 +38,8 @@ rss = "https://api.substack.com/feed/podcast/XXXXXX/private-key.rss"
 
 # Default cap for --download / fetch in a single run. Useful for
 # backfilling a new feed gradually instead of pulling 300 episodes at once.
-# Overridden by an explicit --limit on the CLI.
+# Overridden by `--limit N` on the CLI, or bypassed entirely with
+# `--no-limit` (e.g. when pre-downloading on an unmetered network).
 # max_downloads_per_run = 5
 
 # Order to walk feed entries when downloading. Default: "newest".

@@ -77,7 +77,12 @@ def resolve_feed(args, config: dict) -> None:
 
 
 def effective_limit(args) -> int | None:
-    """CLI --limit wins; otherwise fall back to feed's max_downloads_per_run."""
+    """Resolve the effective per-run cap.
+
+    Precedence: --no-limit > --limit > feed's max_downloads_per_run > unbounded.
+    """
+    if getattr(args, "no_limit", False):
+        return None
     if args.limit is not None:
         return args.limit
     return args._feed_cfg.get("max_downloads_per_run")
@@ -1066,6 +1071,9 @@ def main():
     parser.add_argument("--sid",    default=None, help="substack.sid session cookie (overrides --feed's sid)")
     parser.add_argument("--out",    default=None, help="Output directory (default: ./<kind>/<feed-tag>/)")
     parser.add_argument("--limit",  type=int, default=None, help="Max number of entries")
+    parser.add_argument("--no-limit", action="store_true",
+                        help="Bypass max_downloads_per_run from feeds.toml for this run "
+                             "(useful for bulk pre-downloads on unmetered networks).")
     parser.add_argument("--index",  action="store_true", help="List episodes instead of downloading transcripts")
     parser.add_argument("--download", action="store_true", help="Download mp3 files instead of transcripts")
     parser.add_argument("--transcribe", action="store_true", help="Transcribe mp3s using Whisper")
