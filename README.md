@@ -133,6 +133,7 @@ For episodes Substack already provides a transcript for (not all do):
 | `--no-limit` | | Bypass `max_downloads_per_run` from `feeds.toml`. Useful for bulk pre-downloads on an unmetered network when you'll be processing the audio later at home. Takes precedence over `--limit` if both are given. |
 | `--backfill-headers` | | Splice RSS-derived metadata (title, link, summary, etc.) into existing transcripts that don't yet have YAML frontmatter. Idempotent. Use with `--feed <tag>` to scope to one feed. |
 | `--status` | | Print a per-feed health snapshot (RSS count, local mp3s, transcribed, SD card mp3s/transcripts, orphan mp3s without transcripts, headerless transcripts). Combine with `--offline` to skip the RSS fetch. |
+| `--check` | | List new episodes per feed (in RSS but not in `.processed`), including byte sizes when the feed publishes them. Doesn't download anything — RSS fetch only. Cheap enough for cron / metered connections. Use with `--feed <tag>` to scope. |
 | `--model SIZE` | `medium` | `tiny`, `base`, `small`, `medium`, `large-v3` |
 | `--mp3-dir DIR` | derived from `--feed` | mp3 source for `--transcribe` |
 | `--transcript-dir DIR` | derived from `--feed` | Checked by `--download` to skip already-transcribed episodes |

@@ -1382,6 +1382,84 @@ def run_status(args):
     print("  No-hdr  = local transcripts without YAML frontmatter (run --backfill-headers)")
 
 
+def run_check(args):
+    """List new episodes per feed without downloading anything.
+
+    Cheap and cron-friendly: only the RSS XML is fetched (a few KB).
+    Byte sizes are pulled from RSS enclosure `length` attributes when
+    feeds populate them (most do).
+    """
+    config = getattr(args, "_config", {}) or {}
+    feeds = config.get("feeds", {})
+    if args.feed:
+        feeds = {args.feed: feeds[args.feed]} if args.feed in feeds else {}
+    if not feeds:
+        sys.exit("No feeds in config.")
+
+    grand_new = 0
+    grand_bytes = 0
+
+    for tag in feeds:
+        cfg = feed_cfg_for(config, tag)
+        rss = cfg.get("rss")
+        if not rss:
+            print(f"\n[{tag}] no rss configured")
+            continue
+
+        try:
+            feed = feedparser.parse(rss)
+        except Exception as e:
+            print(f"\n[{tag}] RSS error: {e}")
+            continue
+
+        processed = load_processed(tag) if Path(f"./transcripts/{tag}").is_dir() else set()
+
+        new_episodes: list[tuple[str, str, int]] = []
+        for entry in feed.entries:
+            try:
+                pub_date = pub_date_to_iso(entry)
+                stem = f"{pub_date} - {sanitize_filename(entry.title)}"
+            except Exception:
+                continue
+            if stem in processed:
+                continue
+
+            size_bytes = 0
+            for link in entry.get("links", []):
+                if link.get("type", "").startswith("audio"):
+                    try:
+                        size_bytes = int(link.get("length") or 0)
+                    except (ValueError, TypeError):
+                        size_bytes = 0
+                    break
+            new_episodes.append((pub_date, entry.title, size_bytes))
+
+        new_episodes.sort(key=lambda e: e[0], reverse=True)
+
+        if not new_episodes:
+            print(f"\n[{tag}] up to date")
+            continue
+
+        total_size = sum(s for _, _, s in new_episodes)
+        size_str = f" (~{total_size / (1024*1024):.0f} MB total)" if total_size else ""
+        print(f"\n[{tag}] {len(new_episodes)} new{size_str}")
+        for pub_date, title, size_bytes in new_episodes[:10]:
+            size_mark = f"  ({size_bytes / (1024*1024):.0f} MB)" if size_bytes else ""
+            print(f"    {pub_date}  {title[:75]}{size_mark}")
+        if len(new_episodes) > 10:
+            print(f"    … and {len(new_episodes) - 10} more")
+
+        grand_new += len(new_episodes)
+        grand_bytes += total_size
+
+    print()
+    if grand_new == 0:
+        print("All feeds up to date.")
+    else:
+        gb_str = f" (~{grand_bytes / (1024*1024):.0f} MB)" if grand_bytes else ""
+        print(f"Total: {grand_new} new episode(s){gb_str}")
+
+
 def _split_existing_body(content: str) -> str:
     """Strip the existing markdown header from a legacy transcript, return body.
 
@@ -1689,6 +1767,9 @@ def main():
                         help="Print a per-feed health snapshot (RSS, local, SD card, gaps).")
     parser.add_argument("--offline", action="store_true",
                         help="With --status, skip the RSS fetch and use only local data.")
+    parser.add_argument("--check", action="store_true",
+                        help="List new episodes per feed without downloading. "
+                             "Lightweight enough for cron / metered connections.")
     args = parser.parse_args()
 
     config = load_config(Path(args.config))
@@ -1696,6 +1777,10 @@ def main():
 
     if args.status:
         run_status(args)
+        return
+
+    if args.check:
+        run_check(args)
         return
 
     if args.backfill_headers:
