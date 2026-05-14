@@ -15,6 +15,7 @@ See feeds.example.toml for the config format.
 """
 
 import argparse
+import gc
 import re
 import shutil
 import sys
@@ -400,6 +401,38 @@ def collapse_repetitions(text: str, threshold: int = REPETITION_THRESHOLD) -> st
             out.extend(sentences[i:j + 1])
         i = j + 1
     return " ".join(out)
+
+
+# ── Memory hygiene ────────────────────────────────────────────────────────────
+#
+# Long transcribe runs (hundreds of multi-hour episodes) accumulate Python heap
+# growth from MLX/torch tensors that aren't aggressively returned to the OS.
+# Two-pronged defense: GC + GPU-cache clear after each episode, plus a full
+# model reload every N episodes to truly reset the working set.
+
+RELOAD_EVERY = 10  # full pipeline+model reload cadence (episodes)
+
+
+def _release_memory() -> None:
+    """Force GC + clear MLX/torch GPU caches. No-op if libs aren't loaded."""
+    gc.collect()
+    try:
+        import mlx.core as mx
+        try:
+            mx.clear_cache()
+        except AttributeError:
+            try:
+                mx.metal.clear_cache()
+            except AttributeError:
+                pass
+    except Exception:
+        pass
+    try:
+        import torch
+        if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+            torch.mps.empty_cache()
+    except Exception:
+        pass
 
 
 # ── Diarization ───────────────────────────────────────────────────────────────
@@ -1746,9 +1779,20 @@ def run_transcribe(args):
                 print(f"\nDone. {total_done} file(s) transcribed.")
                 return
 
+            # Re-hydrate models if a periodic reload nuked them. Cheap when not needed.
+            if whisper is None:
+                print(f"  ↻ Reloading Whisper '{desired_model}' (batch_size={desired_batch})...")
+                whisper = LightningWhisperMLX(model=desired_model, batch_size=desired_batch, quant=None)
+                last_batch = desired_batch
+                last_model = desired_model
+            want_diarize = pair_diarize.get(mp3_dir.name, False)
+            if want_diarize and diarization_pipeline is None:
+                print(f"  ↻ Reloading diarization pipeline (pyannote)...")
+                diarization_pipeline = load_diarization_pipeline()
+
             audio_dur = get_audio_duration_secs(mp3_path)
             dur_str = format_duration(str(int(audio_dur))) if audio_dur else "??:??"
-            do_diarize = pair_diarize.get(mp3_dir.name, False) and diarization_pipeline is not None
+            do_diarize = want_diarize and diarization_pipeline is not None
             mode_marker = " (with diarization)" if do_diarize else ""
             print(f"  [{i}/{len(to_process)}] Transcribing{mode_marker} ({dur_str}): {mp3_path.name}")
 
@@ -1808,6 +1852,26 @@ def run_transcribe(args):
                 record_processed(tag, mp3_path.stem)
 
             total_done += 1
+
+            # Per-episode memory hygiene: drop big locals, force GC, clear GPU caches.
+            # MLX/torch tensors on Apple Silicon unified memory accumulate heap
+            # if left to Python's lazy collector — manifests as the process RSS
+            # climbing into the tens of GB over a long run and eventually OOM'ing
+            # the system.
+            result = text = segments = speaker_turns = content = aligned = None
+            _release_memory()
+
+            # Every RELOAD_EVERY episodes, fully tear down models so the next
+            # iteration rebuilds from scratch. Reload cost (~10-20s) is dwarfed
+            # by the heap-reset benefit on multi-hour episodes.
+            if total_done % RELOAD_EVERY == 0:
+                print(f"    ⟳ Periodic model reset (every {RELOAD_EVERY} episodes)")
+                whisper = None
+                last_batch = None
+                last_model = None
+                if diarization_pipeline is not None:
+                    diarization_pipeline = None
+                _release_memory()
 
         post_process(mp3_dir)
 
