@@ -410,7 +410,7 @@ def collapse_repetitions(text: str, threshold: int = REPETITION_THRESHOLD) -> st
 # Two-pronged defense: GC + GPU-cache clear after each episode, plus a full
 # model reload every N episodes to truly reset the working set.
 
-RELOAD_EVERY = 10  # full pipeline+model reload cadence (episodes)
+RELOAD_EVERY = 5  # full pipeline+model reload cadence (episodes)
 
 
 def _release_memory() -> None:
