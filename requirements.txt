@@ -1,6 +1,20 @@
 feedparser
 requests
-lightning-whisper-mlx
+
+# lightning-whisper-mlx is installed with --no-deps in setup.sh because it
+# hard-pins tiktoken==0.3.3, which has no wheels past Python 3.11. Its
+# runtime deps are listed here with looser bounds so they resolve normally.
+# The Encoding API surface used by the library has been stable since 0.3.3.
+tiktoken>=0.7
+huggingface-hub
+mlx
+numba
+numpy
+torch
+tqdm
+more-itertools
+scipy
+
 tomli; python_version < "3.11"
 
 # Optional — only needed when a feed has `diarize = true` in feeds.toml.
