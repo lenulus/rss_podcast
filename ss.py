@@ -768,6 +768,51 @@ def should_subprocess_per_episode(args, feed_cfg: dict) -> bool:
     return bool(feed_cfg.get("subprocess_per_episode", False))
 
 
+def subprocess_concurrency_for(args, feed_cfg: dict) -> int:
+    """CLI override wins; otherwise read TOML. Defaults to 1.
+
+    Only meaningful when subprocess_per_episode is True. Caps the number of
+    concurrent transcribe subprocesses for a single feed — useful when
+    individual subprocesses underutilize the GPU.
+    """
+    flag = getattr(args, "subprocess_concurrency", None)
+    if flag is not None:
+        return max(1, int(flag))
+    return max(1, int(feed_cfg.get("subprocess_concurrency", 1)))
+
+
+class _PrefixedWriter:
+    """Wrap a stream so every written line is prefixed. Used by --label to
+    distinguish stdout from concurrent transcribe subprocesses in the parent's
+    merged output stream.
+
+    Buffers partial writes until a newline lands so the prefix is applied
+    once per logical line, not once per write call.
+    """
+    def __init__(self, stream, prefix: str):
+        self.stream = stream
+        self.prefix = prefix
+        self._buffer = ""
+
+    def write(self, s: str) -> int:
+        if not s:
+            return 0
+        self._buffer += s
+        while "\n" in self._buffer:
+            line, _, self._buffer = self._buffer.partition("\n")
+            self.stream.write(self.prefix + line + "\n")
+        return len(s)
+
+    def flush(self) -> None:
+        if self._buffer:
+            self.stream.write(self.prefix + self._buffer)
+            self._buffer = ""
+        self.stream.flush()
+
+    def __getattr__(self, name):
+        return getattr(self.stream, name)
+
+
 def diarize_cache_path(mp3_path: Path, transcript_dir: Path) -> Path:
     """Sidecar location for cached pyannote turns."""
     return transcript_dir / ".diarize" / f"{mp3_path.stem}.json"
@@ -1711,57 +1756,107 @@ def transcribe_pairs(args) -> list[tuple[Path, Path]]:
 
 def _run_feed_via_subprocess(args, mp3_dir: Path, out_dir: Path,
                              to_process: list[Path],
-                             limit_remaining: int | None = None) -> int:
-    """Process one feed by spawning a fresh subprocess per episode.
+                             limit_remaining: int | None = None,
+                             concurrency: int = 1) -> int:
+    """Process one feed by spawning fresh subprocesses, one per episode.
 
-    Each subprocess runs `ss.py --feed <tag> --transcribe --limit 1
-    --no-subprocess-per-episode`, which loads models, processes a single
-    episode, and exits. Process teardown reliably reclaims MPS allocator
-    state that the in-process reload-every-N strategy can only partially
-    reset.
+    Each subprocess runs `ss.py --feed <tag> --transcribe --only <stem>
+    --no-subprocess-per-episode`, which loads models, processes one
+    specific episode, and exits. Process teardown reliably reclaims MPS
+    allocator state that the in-process reload-every-N strategy can only
+    partially reset.
+
+    The parent dispatches `--only <stem>` per worker, so multiple workers
+    never race over which pending episode to claim — assignment happens
+    here, in serial order, before any work is spawned.
 
     `limit_remaining` caps how many episodes this helper will dispatch
     (used to honor the parent's --limit). None means no cap.
 
+    `concurrency` is the maximum number of subprocesses to run in parallel.
+    Each worker has its own pyannote + Whisper instance (~3 GB unified
+    memory). Workers share the Metal command queue, so per-episode pace
+    degrades modestly while total throughput rises.
+
     Returns the number of episodes successfully processed.
     """
     import subprocess
+    from concurrent.futures import ThreadPoolExecutor, as_completed
     tag = mp3_dir.name
-    total = len(to_process)
-    print(f"\n[{mp3_dir}] {total} mp3(s) → {out_dir}  (subprocess-per-episode)")
 
-    base_cmd = [
-        sys.executable, str(Path(__file__).resolve()),
-        "--config", args.config,
-        "--feed", tag,
-        "--transcribe", "--limit", "1",
-        "--no-subprocess-per-episode",
-    ]
-    if args.diarize is not None:
-        base_cmd.append("--diarize" if args.diarize else "--no-diarize")
-    if args.model is not None:
-        base_cmd.extend(["--model", args.model])
+    # Snapshot the actually-pending set now and respect limit_remaining upfront.
+    # Concurrency requires explicit per-worker --only assignment; doing it here
+    # ahead of dispatch keeps the loop race-free.
+    existing = load_processed(tag)
+    pending = [f for f in to_process if f.stem not in existing]
+    if limit_remaining is not None:
+        pending = pending[:limit_remaining]
+    total = len(pending)
+    if total == 0:
+        return 0
+
+    concurrency = max(1, min(concurrency, total))
+    mode_note = f"concurrency={concurrency}" if concurrency > 1 else "serial"
+    print(f"\n[{mp3_dir}] {total} mp3(s) → {out_dir}  (subprocess-per-episode, {mode_note})")
+
+    def child_cmd(mp3: Path, worker_id: int) -> list[str]:
+        cmd = [
+            sys.executable, str(Path(__file__).resolve()),
+            "--config", args.config,
+            "--feed", tag,
+            "--transcribe",
+            "--no-subprocess-per-episode",
+            "--only", mp3.stem,
+        ]
+        if concurrency > 1:
+            cmd.extend(["--label", f"[w{worker_id}]"])
+        if args.diarize is not None:
+            cmd.append("--diarize" if args.diarize else "--no-diarize")
+        if args.model is not None:
+            cmd.extend(["--model", args.model])
+        return cmd
 
     processed = 0
-    while True:
-        if limit_remaining is not None and processed >= limit_remaining:
-            return processed
-        existing = load_processed(tag)
-        remaining = [f for f in to_process if f.stem not in existing]
-        if not remaining:
-            break
-        nxt = remaining[0]
-        idx = total - len(remaining) + 1
-        print(f"\n  → subprocess [{idx}/{total}]: {nxt.name}")
-        result = subprocess.run(base_cmd)
-        if result.returncode != 0:
-            print(f"  ✗ Subprocess exited {result.returncode}.")
-        # Verify forward progress; abort the feed if the same episode is still pending.
-        existing = load_processed(tag)
-        if nxt.stem not in existing:
-            print(f"  ✗ {nxt.name} still pending after subprocess. Aborting feed.")
-            break
-        processed += 1
+    if concurrency == 1:
+        # Serial path — preserves the original log shape, simpler to reason about.
+        for idx, mp3 in enumerate(pending, 1):
+            print(f"\n  → subprocess [{idx}/{total}]: {mp3.name}")
+            result = subprocess.run(child_cmd(mp3, 1))
+            if result.returncode != 0:
+                print(f"  ✗ Subprocess exited {result.returncode}.")
+            existing = load_processed(tag)
+            if mp3.stem not in existing:
+                print(f"  ✗ {mp3.name} still pending after subprocess. Aborting feed.")
+                break
+            processed += 1
+        return processed
+
+    # Parallel path — submit all pending up front; the executor caps in-flight
+    # to `concurrency`. Worker labels cycle through [w1..wN] by submission order.
+    with ThreadPoolExecutor(max_workers=concurrency) as ex:
+        future_to_meta: dict = {}
+        for idx, mp3 in enumerate(pending, 1):
+            worker_id = ((idx - 1) % concurrency) + 1
+            print(f"  → queue [{idx}/{total}]: {mp3.name}  (w{worker_id})")
+            future = ex.submit(subprocess.run, child_cmd(mp3, worker_id))
+            future_to_meta[future] = (mp3, idx)
+
+        for future in as_completed(future_to_meta):
+            mp3, idx = future_to_meta[future]
+            try:
+                result = future.result()
+                if result.returncode != 0:
+                    print(f"  ✗ [{idx}/{total}] {mp3.name} exited {result.returncode}.")
+                    continue
+            except Exception as e:
+                print(f"  ✗ [{idx}/{total}] {mp3.name} crashed: {e}")
+                continue
+            existing = load_processed(tag)
+            if mp3.stem not in existing:
+                print(f"  ✗ [{idx}/{total}] {mp3.name} still pending after subprocess.")
+                continue
+            processed += 1
+            print(f"  ✓ [{idx}/{total}] {mp3.name}")
     return processed
 
 
@@ -1788,6 +1883,11 @@ def run_transcribe(args):
         else:
             existing = {p.stem for p in out_dir.glob("*.md")} if out_dir.is_dir() else set()
         to_process = [f for f in mp3s if f.stem not in existing]
+        # --only <stem> narrows this run to a single episode by stem name.
+        # Used by --subprocess-per-episode to dispatch specific episodes
+        # from a parent's parallel queue without races.
+        if getattr(args, "only", None):
+            to_process = [f for f in to_process if f.stem == args.only]
         plan.append((mp3_dir, out_dir, to_process))
         pair_diarize[tag] = should_diarize(args, feed_cfg)
         pair_batch[tag] = int(feed_cfg.get("whisper_batch_size", 12))
@@ -1842,8 +1942,11 @@ def run_transcribe(args):
 
         if pair_subprocess.get(mp3_dir.name, False):
             limit_remaining = (args.limit - total_done) if args.limit else None
+            tag = mp3_dir.name
+            concurrency = subprocess_concurrency_for(args, feed_cfg_for(config, tag))
             done = _run_feed_via_subprocess(args, mp3_dir, out_dir, to_process,
-                                            limit_remaining=limit_remaining)
+                                            limit_remaining=limit_remaining,
+                                            concurrency=concurrency)
             total_done += done
             post_process(mp3_dir)
             if args.limit and total_done >= args.limit:
@@ -1999,6 +2102,18 @@ def main():
                              "Runs each episode in a fresh Python process to isolate MPS "
                              "allocator state; trades ~30-60s model-load overhead per episode "
                              "for predictable, bounded per-episode cost on long backlogs.")
+    parser.add_argument("--subprocess-concurrency", type=int, default=None,
+                        help="Max concurrent transcribe subprocesses for one feed "
+                             "(overrides feeds.toml). Only meaningful with "
+                             "--subprocess-per-episode. Each worker uses ~3 GB unified memory.")
+    parser.add_argument("--only", default=None,
+                        help="Restrict --transcribe to a single mp3 by stem name. "
+                             "Used internally by --subprocess-per-episode to dispatch "
+                             "specific episodes to parallel workers without races.")
+    parser.add_argument("--label", default=None,
+                        help="Prefix every stdout line with the given text. Used internally "
+                             "to distinguish concurrent transcribe subprocesses in the parent's "
+                             "merged log stream.")
     parser.add_argument("--backfill-headers", action="store_true",
                         help="For existing transcripts, fetch each feed's RSS and splice "
                              "metadata (title, link, summary, etc.) into the .md header. "
@@ -2016,6 +2131,11 @@ def main():
                              "don't block the rest of the routine. With --feed <tag>, "
                              "scopes the routine to that one feed.")
     args = parser.parse_args()
+
+    # Wrap stdout for concurrent subprocesses so each line carries its worker
+    # label (set by the parent via --label). Skipped when --label is empty.
+    if args.label:
+        sys.stdout = _PrefixedWriter(sys.stdout, args.label + " ")
 
     config = load_config(Path(args.config))
     resolve_feed(args, config)

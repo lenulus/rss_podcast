@@ -87,6 +87,14 @@ rss = "https://api.substack.com/feed/podcast/XXXXXX/private-key.rss"
 # a single run. CLI: --subprocess-per-episode / --no-subprocess-per-episode.
 # subprocess_per_episode = true
 
+# How many transcribe subprocesses to run in parallel for this feed.
+# Defaults to 1 (serial). Only meaningful with subprocess_per_episode = true.
+# Each worker has its own pyannote + Whisper instance (~3 GB unified memory).
+# Workers share the Metal command queue, so per-episode pace drops modestly
+# while total throughput rises (concurrency=2 ≈ 1.6× single-worker throughput).
+# Safe up to ~4 on a 64 GB machine. CLI: --subprocess-concurrency N.
+# subprocess_concurrency = 2
+
 # [feeds.another-feed]
 # rss = "https://api.substack.com/feed/podcast/YYYYYY/private-key.rss"
 # max_episodes_on_disk = 10

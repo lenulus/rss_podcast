@@ -41,6 +41,7 @@ Operating reference for `./run.sh` — designed for Claude (or other automated a
 - **Diarize**: `--diarize` / `--no-diarize` > feed `diarize` > `false`
 - **Model**: `--model X` > feed `model` > `"medium"`
 - **Subprocess-per-episode**: `--subprocess-per-episode` / `--no-subprocess-per-episode` > feed `subprocess_per_episode` > `false`
+- **Subprocess concurrency**: `--subprocess-concurrency N` > feed `subprocess_concurrency` > `1`
 - **Host (speaker naming)**: feed `host` > RSS `itunes_author` > generic `Speaker A/B/C`
 - **Backup path**: per-feed `media_dir` / `transcript_dir` > per-feed `backup_path` > `[defaults].backup_path`
 
@@ -67,6 +68,9 @@ whisper_batch_size = 12               # optional, default 12; lower (e.g. 6) for
 subprocess_per_episode = false        # optional, default false; isolate each episode in a
                                       # fresh Python process to dodge MPS allocator drift
                                       # on long backlogs (50+ eps). +30-60s/ep overhead.
+subprocess_concurrency = 1            # optional, default 1; max parallel subprocesses for
+                                      # this feed. Only used when subprocess_per_episode=true.
+                                      # Each worker uses ~3 GB unified memory.
 ```
 
 ## Always check before risky operations
