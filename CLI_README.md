@@ -40,6 +40,7 @@ Operating reference for `./run.sh` — designed for Claude (or other automated a
 - **Limit**: `--no-limit` > `--limit N` > feed `max_downloads_per_run` > unbounded
 - **Diarize**: `--diarize` / `--no-diarize` > feed `diarize` > `false`
 - **Model**: `--model X` > feed `model` > `"medium"`
+- **Subprocess-per-episode**: `--subprocess-per-episode` / `--no-subprocess-per-episode` > feed `subprocess_per_episode` > `false`
 - **Host (speaker naming)**: feed `host` > RSS `itunes_author` > generic `Speaker A/B/C`
 - **Backup path**: per-feed `media_dir` / `transcript_dir` > per-feed `backup_path` > `[defaults].backup_path`
 
@@ -63,6 +64,9 @@ media_dir = "..."                     # optional, fully overrides media backup p
 transcript_dir = "..."                # optional, fully overrides transcript backup path
 model = "large-v3"                    # optional, default "medium"
 whisper_batch_size = 12               # optional, default 12; lower (e.g. 6) for 3 h+ episodes
+subprocess_per_episode = false        # optional, default false; isolate each episode in a
+                                      # fresh Python process to dodge MPS allocator drift
+                                      # on long backlogs (50+ eps). +30-60s/ep overhead.
 ```
 
 ## Always check before risky operations

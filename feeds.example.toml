@@ -76,6 +76,17 @@ rss = "https://api.substack.com/feed/podcast/XXXXXX/private-key.rss"
 # slowdown (batch=6 ≈ 2x slower than batch=12).
 # whisper_batch_size = 6
 
+# Run each episode in a fresh Python subprocess instead of an in-process loop.
+# Defaults to false. The in-process loop is faster per episode (shared model
+# load) but PyTorch's MPS allocator and MLX's Metal kernel cache accumulate
+# state across episodes, causing progressive slowdown on long backlogs
+# (50+ episodes). The per-episode reset (every RELOAD_EVERY=5 episodes)
+# only partially clears this. Subprocess mode adds ~30-60s of model-load
+# overhead per episode but makes per-episode cost predictable and bounded.
+# Recommended when you observe diarize/Whisper times creeping upward across
+# a single run. CLI: --subprocess-per-episode / --no-subprocess-per-episode.
+# subprocess_per_episode = true
+
 # [feeds.another-feed]
 # rss = "https://api.substack.com/feed/podcast/YYYYYY/private-key.rss"
 # max_episodes_on_disk = 10

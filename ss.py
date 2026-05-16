@@ -754,6 +754,20 @@ def should_diarize(args, feed_cfg: dict) -> bool:
     return bool(feed_cfg.get("diarize", False))
 
 
+def should_subprocess_per_episode(args, feed_cfg: dict) -> bool:
+    """CLI override wins; otherwise read TOML. Defaults to False.
+
+    When True, each episode of the feed runs in a fresh Python subprocess
+    instead of the in-process loop. Trades ~30-60s per-episode model-load
+    overhead for predictable per-episode cost on long backlogs where
+    MPS allocator fragmentation otherwise causes progressive slowdown.
+    """
+    flag = getattr(args, "subprocess_per_episode", None)
+    if flag is not None:
+        return bool(flag)
+    return bool(feed_cfg.get("subprocess_per_episode", False))
+
+
 def diarize_cache_path(mp3_path: Path, transcript_dir: Path) -> Path:
     """Sidecar location for cached pyannote turns."""
     return transcript_dir / ".diarize" / f"{mp3_path.stem}.json"
@@ -1695,6 +1709,62 @@ def transcribe_pairs(args) -> list[tuple[Path, Path]]:
     return [(downloads_root, Path("./transcripts"))]
 
 
+def _run_feed_via_subprocess(args, mp3_dir: Path, out_dir: Path,
+                             to_process: list[Path],
+                             limit_remaining: int | None = None) -> int:
+    """Process one feed by spawning a fresh subprocess per episode.
+
+    Each subprocess runs `ss.py --feed <tag> --transcribe --limit 1
+    --no-subprocess-per-episode`, which loads models, processes a single
+    episode, and exits. Process teardown reliably reclaims MPS allocator
+    state that the in-process reload-every-N strategy can only partially
+    reset.
+
+    `limit_remaining` caps how many episodes this helper will dispatch
+    (used to honor the parent's --limit). None means no cap.
+
+    Returns the number of episodes successfully processed.
+    """
+    import subprocess
+    tag = mp3_dir.name
+    total = len(to_process)
+    print(f"\n[{mp3_dir}] {total} mp3(s) → {out_dir}  (subprocess-per-episode)")
+
+    base_cmd = [
+        sys.executable, str(Path(__file__).resolve()),
+        "--config", args.config,
+        "--feed", tag,
+        "--transcribe", "--limit", "1",
+        "--no-subprocess-per-episode",
+    ]
+    if args.diarize is not None:
+        base_cmd.append("--diarize" if args.diarize else "--no-diarize")
+    if args.model is not None:
+        base_cmd.extend(["--model", args.model])
+
+    processed = 0
+    while True:
+        if limit_remaining is not None and processed >= limit_remaining:
+            return processed
+        existing = load_processed(tag)
+        remaining = [f for f in to_process if f.stem not in existing]
+        if not remaining:
+            break
+        nxt = remaining[0]
+        idx = total - len(remaining) + 1
+        print(f"\n  → subprocess [{idx}/{total}]: {nxt.name}")
+        result = subprocess.run(base_cmd)
+        if result.returncode != 0:
+            print(f"  ✗ Subprocess exited {result.returncode}.")
+        # Verify forward progress; abort the feed if the same episode is still pending.
+        existing = load_processed(tag)
+        if nxt.stem not in existing:
+            print(f"  ✗ {nxt.name} still pending after subprocess. Aborting feed.")
+            break
+        processed += 1
+    return processed
+
+
 def run_transcribe(args):
     """Transcribe mp3 files using Lightning Whisper MLX (Apple Silicon GPU)."""
     pairs = transcribe_pairs(args)
@@ -1705,6 +1775,7 @@ def run_transcribe(args):
     pair_diarize: dict[str, bool] = {}
     pair_batch: dict[str, int] = {}
     pair_model: dict[str, str] = {}
+    pair_subprocess: dict[str, bool] = {}
     for mp3_dir, out_dir in pairs:
         if not mp3_dir.is_dir():
             print(f"  ↷ Skip {mp3_dir}: not a directory.")
@@ -1722,10 +1793,12 @@ def run_transcribe(args):
         pair_batch[tag] = int(feed_cfg.get("whisper_batch_size", 12))
         # CLI --model wins; otherwise per-feed `model`; otherwise default.
         pair_model[tag] = args.model if args.model is not None else feed_cfg.get("model", "medium")
+        pair_subprocess[tag] = should_subprocess_per_episode(args, feed_cfg)
         diar_marker = "  ✦ diarize" if pair_diarize[tag] else ""
         batch_marker = f"  batch={pair_batch[tag]}" if pair_batch[tag] != 12 else ""
         model_marker = f"  model={pair_model[tag]}" if pair_model[tag] != "medium" else ""
-        print(f"  {mp3_dir}: {len(mp3s)} mp3(s), {len(existing)} transcribed, {len(to_process)} pending → {out_dir}{diar_marker}{batch_marker}{model_marker}")
+        subproc_marker = "  ⊞ subprocess" if pair_subprocess[tag] else ""
+        print(f"  {mp3_dir}: {len(mp3s)} mp3(s), {len(existing)} transcribed, {len(to_process)} pending → {out_dir}{diar_marker}{batch_marker}{model_marker}{subproc_marker}")
 
     def post_process(mp3_dir: Path):
         """Run transcript backup + mp3 pruning for a finished feed dir."""
@@ -1744,13 +1817,18 @@ def run_transcribe(args):
         return
 
     print(f"\nDevice: Apple Silicon GPU (MLX)")
-    from lightning_whisper_mlx import LightningWhisperMLX
     whisper = None
     last_batch: int | None = None
     last_model: str | None = None
 
+    # Only load diarize pipeline upfront for feeds that run in-process — subprocess-mode
+    # feeds load their own pipeline inside each child process.
     diarization_pipeline = None
-    if any(pair_diarize.values()):
+    in_process_diarize_needed = any(
+        pair_diarize.get(d.name, False) and not pair_subprocess.get(d.name, False)
+        for d, _, _ in plan
+    )
+    if in_process_diarize_needed:
         print("Loading diarization pipeline (pyannote)...")
         diarization_pipeline = load_diarization_pipeline()
 
@@ -1761,6 +1839,21 @@ def run_transcribe(args):
             post_process(mp3_dir)
             continue
         out_dir.mkdir(parents=True, exist_ok=True)
+
+        if pair_subprocess.get(mp3_dir.name, False):
+            limit_remaining = (args.limit - total_done) if args.limit else None
+            done = _run_feed_via_subprocess(args, mp3_dir, out_dir, to_process,
+                                            limit_remaining=limit_remaining)
+            total_done += done
+            post_process(mp3_dir)
+            if args.limit and total_done >= args.limit:
+                print(f"\nLimit of {args.limit} reached.")
+                print(f"\nDone. {total_done} file(s) transcribed.")
+                return
+            continue
+
+        # Lazy-load Whisper for in-process feeds only.
+        from lightning_whisper_mlx import LightningWhisperMLX
 
         desired_batch = pair_batch.get(mp3_dir.name, 12)
         desired_model = pair_model.get(mp3_dir.name, "medium")
@@ -1901,6 +1994,11 @@ def main():
                              "Overrides per-feed `model` from feeds.toml when set.")
     parser.add_argument("--diarize", action=argparse.BooleanOptionalAction, default=None,
                         help="Force speaker diarization on/off (overrides feeds.toml)")
+    parser.add_argument("--subprocess-per-episode", action=argparse.BooleanOptionalAction, default=None,
+                        help="Force subprocess-per-episode mode on/off (overrides feeds.toml). "
+                             "Runs each episode in a fresh Python process to isolate MPS "
+                             "allocator state; trades ~30-60s model-load overhead per episode "
+                             "for predictable, bounded per-episode cost on long backlogs.")
     parser.add_argument("--backfill-headers", action="store_true",
                         help="For existing transcripts, fetch each feed's RSS and splice "
                              "metadata (title, link, summary, etc.) into the .md header. "
