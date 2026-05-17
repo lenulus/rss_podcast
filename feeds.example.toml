@@ -3,10 +3,14 @@
 # subfolder name under ./downloads/<tag>/ and ./transcripts/<tag>/.
 #
 # Backups (when configured) land at:
-#   <backup_path>/<tag>/media/<file>.mp3   — copied during eviction
-#   <backup_path>/<tag>/text/<file>.md     — copied on every operation,
-#                                            never deleted from local
-# Override either path with media_dir / transcript_dir at the feed level.
+#   <backup_path>/<tag>/media/<file>.mp3            — copied during eviction
+#   <backup_path>/<tag>/text/<file>.md              — copied on every operation,
+#                                                     never deleted from local
+#   <backup_path>/<tag>/text/.diarize/<stem>.json   — pyannote turn cache;
+#                                                     copied on every operation
+#                                                     (cheap to back up, expensive
+#                                                     to regenerate)
+# Override the media / text roots with media_dir / transcript_dir at the feed level.
 
 # ── Defaults applied to every feed (per-feed values override) ────────────────
 [defaults]

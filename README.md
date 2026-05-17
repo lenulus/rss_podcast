@@ -43,7 +43,7 @@ backup_path = "/Volumes/OtherSD/archive"     # overrides default for this feed
 # transcript_dir = "/Volumes/Cloud/new-show" # overrides just the transcript path
 ```
 
-Backups land at `<backup_path>/<tag>/media/` (mp3s) and `<backup_path>/<tag>/text/` (transcripts). Transcript backup runs on every `--download`, `--transcribe`, and `--fetch` — it's idempotent and never deletes from local. Mp3 eviction only happens when `max_episodes_on_disk` is set.
+Backups land at `<backup_path>/<tag>/media/` (mp3s), `<backup_path>/<tag>/text/` (transcripts), and `<backup_path>/<tag>/text/.diarize/` (pyannote turn cache). Transcript and diarize-cache backup runs on every `--download`, `--transcribe`, and `--fetch` — idempotent and never deletes from local. Mp3 eviction only happens when `max_episodes_on_disk` is set. The diarize-cache backup is cheap (a few KB per episode) and lets a fresh clone with the SD card mounted recover the cache instead of re-paying hours of pyannote compute.
 
 ### Per-feed settings
 
@@ -54,7 +54,7 @@ These can be set under `[defaults]` (applies to every feed) or under `[feeds.<ta
 | `rss` | Private RSS feed URL (required, per-feed only) |
 | `sid` | `substack.sid` cookie for paywalled transcripts |
 | `max_episodes_on_disk` | Cap mp3s kept in `./downloads/<tag>/`. Eviction runs after `--download` and `--transcribe`; oldest go first, but **only mp3s that already have a transcript are eligible** — source audio is never deleted unless its transcript exists. Transcripts themselves are never touched. |
-| `backup_path` | Root for backups. Mp3s back up to `<backup_path>/<tag>/media/<file>.mp3`; transcripts back up to `<backup_path>/<tag>/text/<file>.md`. If the path (or its parent — e.g. an unmounted SD card mount point) is missing, the affected backup is **skipped entirely** rather than risking unbacked deletion. |
+| `backup_path` | Root for backups. Mp3s back up to `<backup_path>/<tag>/media/<file>.mp3`; transcripts back up to `<backup_path>/<tag>/text/<file>.md`; pyannote turn caches back up to `<backup_path>/<tag>/text/.diarize/<stem>.json`. If the path (or its parent — e.g. an unmounted SD card mount point) is missing, the affected backup is **skipped entirely** rather than risking unbacked deletion. |
 | `media_dir` | Override where this feed's mp3 backups land. Absolute path. If set, replaces `<backup_path>/<tag>/media/`. |
 | `transcript_dir` | Override where this feed's transcript backups land. Absolute path. If set, replaces `<backup_path>/<tag>/text/`. |
 | `max_downloads_per_run` | Default cap for `--download` and the transcript-fetch path in a single run. Overridden by an explicit `--limit N` or bypassed entirely with `--no-limit`. |
@@ -182,7 +182,7 @@ Transcripts are Markdown files named `YYYY-MM-DD - Episode Title.md` under `./tr
 
 Sidecars:
 - `./downloads/<feed-tag>/<stem>.meta.json` — episode metadata captured at download (small, paired with the mp3, removed during eviction)
-- `./transcripts/<feed-tag>/.diarize/<stem>.json` — cached pyannote turns (lets a retry skip the ~40-min diarize pass on long files)
+- `./transcripts/<feed-tag>/.diarize/<stem>.json` — cached pyannote turns (lets a retry skip the ~40-min diarize pass on long files). Mirrored to `<backup_path>/<tag>/text/.diarize/` on every pass — a fresh clone with the SD card mounted can copy these back to skip re-diarize entirely.
 - `./transcripts/<feed-tag>/.chunks/<stem>/chunk_NNN.json` — per-chunk Whisper output, written as each chunk completes. If transcribe crashes mid-file, a retry resumes from the last successful chunk. Cleaned up automatically once all chunks merge.
 
 ## Speaker diarization (optional)
