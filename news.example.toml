@@ -30,6 +30,21 @@ url = "https://deepmind.google/blog/feed"
 type = "rss"
 url = "https://research.google/blog/rss"
 
+# swyx's daily AI news roundup, published as a section of the Latent Space
+# Substack. Distinct from the smol.ai/news bot (terser daily blurbs) — this
+# is the substantive weekday roundup with names like "[AINews] Cerebras'
+# $60B IPO", "[AINews] The End of Finetuning". sectionId=327741 isolates
+# the AINews-only stream (the bare /feed mixes podcast episodes in).
+#
+# Most posts are paywalled. To unlock with a paid subscription, set
+# `sid = "..."` to the value of the `connect.sid` cookie on www.latent.space
+# (Application → Cookies → www.latent.space in browser dev tools, NOT the
+# substack.com cookie list — those are scoped to a different origin).
+[sources.latent-space-ainews]
+type = "rss"
+url = "https://www.latent.space/feed?sectionId=327741"
+# sid = "s%3A..."   # connect.sid cookie from www.latent.space; unlocks paid bodies
+
 [sources.google-keyword]
 type = "rss"
 # AI-specific subfeed (filters out the generic Keyword noise like Brandcast,

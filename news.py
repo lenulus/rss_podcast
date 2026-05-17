@@ -283,10 +283,34 @@ def discover_hf_papers(source_cfg: dict) -> list[tuple]:
 
 # ── Article fetch + extract ───────────────────────────────────────────────────
 
-def fetch_and_extract(url: str) -> Optional[tuple[str, dict]]:
-    """Return (markdown_body, metadata_dict) or None on failure."""
+def fetch_and_extract(url: str, sid: Optional[str] = None) -> Optional[tuple[str, dict]]:
+    """Return (markdown_body, metadata_dict) or None on failure.
+
+    When `sid` is provided, fetches via `requests` with the Substack
+    session cookie attached (`connect.sid=<sid>`, the express-session
+    cookie name that custom-domain Substack publications use). Unlocks
+    paywalled content for publications the cookie's owner has access to.
+    Without sid, falls back to trafilatura's default fetcher.
+
+    Note: Substack uses `connect.sid` per publication custom domain
+    (e.g. www.latent.space). The substack.com top-level cookie is named
+    differently (substack.sid + substack.lli combo) and does NOT travel
+    cross-origin to the custom domain. Always copy the cookie from the
+    publication's own domain in dev tools, not from substack.com.
+    """
     try:
-        downloaded = trafilatura.fetch_url(url)
+        if sid:
+            r = requests.get(
+                url,
+                headers={"User-Agent": DEFAULT_USER_AGENT},
+                cookies={"connect.sid": sid},
+                timeout=HTTP_TIMEOUT,
+                allow_redirects=True,
+            )
+            r.raise_for_status()
+            downloaded = r.text
+        else:
+            downloaded = trafilatura.fetch_url(url)
     except Exception as e:
         print(f"    ✗ fetch failed: {e}")
         return None
@@ -561,7 +585,7 @@ def process_source(source: str, source_cfg: dict, defaults: dict,
             out_path, content, published = render_hf_paper(source, payload)
             body_len = len(payload.get("summary", "") or "") + len(payload.get("ai_summary", "") or "")
         else:
-            extracted = fetch_and_extract(url)
+            extracted = fetch_and_extract(url, sid=source_cfg.get("sid"))
             if not extracted:
                 time.sleep(delay)
                 continue
