@@ -16,6 +16,7 @@ Operating reference for `./run.sh` — designed for Claude (or other automated a
 | `transcripts/<tag>/.chunks/<stem>/chunk_NNN.json` | tool | per-chunk Whisper output (resumable on crash; auto-removed on success) |
 | `<backup_path>/<tag>/media/*.mp3` | tool | SD card mp3 archive (eviction target) |
 | `<backup_path>/<tag>/text/*.md` | tool | SD card transcript archive (mtime-synced) |
+| `<backup_path>/<tag>/text/.diarize/*.json` | tool | SD card diarize-cache backup (mtime-synced; preserves hours of pyannote compute across fresh-clone / disaster-recovery) |
 
 `<backup_path>` comes from `[defaults]` or per-feed `backup_path` in `feeds.toml`. The script never deletes anything on the SD card. Local mp3s are only deleted if (a) a transcript exists in `.processed`, and (b) the backup path is reachable.
 
@@ -95,6 +96,7 @@ A bulk pre-download or full backfill should always be preceded by `--check` to s
 | Whole-file mp3 corruption suspected | Delete the local mp3 and its `<stem>.meta.json`, remove the stem from `.processed`, re-run `--download` + `--transcribe`. |
 | SD card not mounted during eviction or backup | Eviction is skipped automatically with a warning. Re-mount and re-run any normal command (eviction + backup retry on the next pass). |
 | Stale SD card transcript after re-render | Run any pass that touches the feed; the mtime check refreshes. |
+| Fresh clone needs the diarize cache to avoid hours of re-diarize | Copy `<backup_path>/<tag>/text/.diarize/` → `transcripts/<tag>/.diarize/`, then run `--transcribe`. Backups are written on every pass when the SD card is mounted. |
 | Force re-transcribe of one episode | Remove its stem from `transcripts/<tag>/.processed` (and delete the `.md` so the speaker labels regenerate). Then `--transcribe`. Diarize cache reused — only Whisper re-runs. |
 | Force re-render headers/chapters without re-transcribing | Just run `--backfill-headers`. It rewrites existing `.md` files in place from current RSS metadata. Idempotent. **Do not delete the `.md` first** — backfill needs the body. |
 | Relabel speakers on an existing diarized transcript | Same as "force re-transcribe": clear `.processed` entry + delete `.md`. Cached diarization (`.diarize/<stem>.json`) makes Whisper the only slow step. |
@@ -137,7 +139,7 @@ When both stages run in one subprocess (`--transcribe`), per-feed concurrency is
 - **`--limit` and `--no-limit` are mutually exclusive in intent** — if both are passed, `--no-limit` wins (it's the more explicit override).
 - **`max_episodes_on_disk` triggers eviction at end of `--download` and `--transcribe`** — so setting it after a fresh bulk download will immediately evict, which is fine *if* the SD card is mounted. If not, eviction is skipped with a warning (safe).
 - **Chapter detection is heuristic** — it parses RSS descriptions for `(MM:SS) – Title` patterns. If a feed's description doesn't use that format, no chapters get injected. Re-running `--backfill-headers` is safe (idempotent) once a feed adopts the pattern.
-- **Sidecar files (`.processed`, `.diarize/`, `.chunks/`, `.meta.json`) are not committed to git** — `transcripts/` and `downloads/` are gitignored in their entirety. Don't expect them to survive a fresh clone; the `.processed` index bootstraps from existing `.md` files on first run.
+- **Sidecar files (`.processed`, `.chunks/`, `.meta.json`) are not committed to git** — `transcripts/` and `downloads/` are gitignored in their entirety. Don't expect them to survive a fresh clone; the `.processed` index bootstraps from existing `.md` files on first run. **Exception: `.diarize/<stem>.json` is mirrored to the SD card backup** (`<text_dir>/.diarize/`) on every `--transcribe` / `--diarize-only` pass, so a re-clone with the SD card mounted recovers the diarize cache and avoids re-paying that compute.
 - **Background tasks during downloads should NOT touch `./downloads/<tag>/`** — the dedup check happens at start, but new files arriving mid-run could fool the skip logic.
 
 ## When committing changes

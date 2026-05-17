@@ -1106,6 +1106,61 @@ def backup_feed_transcripts(tag: str, feed_cfg: dict) -> None:
         print(f"  [{tag}] Backed up {' + '.join(parts)} transcript(s) → {text_dir}")
 
 
+def backup_feed_diarizations(tag: str, feed_cfg: dict) -> None:
+    """Sync ./transcripts/<tag>/.diarize/*.json to <text_dir>/.diarize/.
+
+    The diarize cache is small (~few KB per episode, ~MB per feed) but
+    expensive to regenerate — a full pyannote pass over a 200-hour backlog
+    is hours of compute. Backing it up next to the transcripts means a
+    fresh clone or disaster-recovery scenario doesn't force a re-diarize.
+    Idempotent and mtime-aware, same shape as backup_feed_transcripts.
+    """
+    src = Path(f"./transcripts/{tag}/.diarize")
+    if not src.is_dir():
+        return
+    json_files = sorted(src.glob("*.json"))
+    if not json_files:
+        return
+
+    text_dir = resolve_transcript_dir(tag, feed_cfg)
+    if text_dir is None:
+        return
+
+    dest_dir = text_dir / ".diarize"
+    try:
+        dest_dir.mkdir(parents=True, exist_ok=True)
+    except OSError as e:
+        print(f"  ⚠ [{tag}] cannot create diarize backup dir {dest_dir}: {e} — skipping.")
+        return
+
+    copied = 0
+    refreshed = 0
+    for j in json_files:
+        dest = dest_dir / j.name
+        if dest.exists():
+            if dest.stat().st_mtime >= j.stat().st_mtime:
+                continue
+            try:
+                shutil.copy2(j, dest)
+                refreshed += 1
+            except OSError as e:
+                print(f"  ✗ [{tag}] diarize cache refresh failed for {j.name}: {e}")
+            continue
+        try:
+            shutil.copy2(j, dest)
+            copied += 1
+        except OSError as e:
+            print(f"  ✗ [{tag}] diarize cache backup failed for {j.name}: {e}")
+
+    if copied or refreshed:
+        parts = []
+        if copied:
+            parts.append(f"{copied} new")
+        if refreshed:
+            parts.append(f"{refreshed} updated")
+        print(f"  [{tag}] Backed up {' + '.join(parts)} diarize cache(s) → {dest_dir}")
+
+
 # ── Eviction ──────────────────────────────────────────────────────────────────
 
 def prune_feed_mp3s(tag: str, feed_cfg: dict) -> None:
@@ -1925,12 +1980,13 @@ def run_transcribe(args):
         print(f"  {mp3_dir}: {len(mp3s)} mp3(s), {len(existing)} {done_label}, {len(to_process)} pending → {out_dir}{diar_marker}{batch_marker}{model_marker}{subproc_marker}{only_marker}")
 
     def post_process(mp3_dir: Path):
-        """Run transcript backup + mp3 pruning for a finished feed dir."""
+        """Run transcript + diarize-cache backup, then mp3 pruning for a finished feed dir."""
         tag = mp3_dir.name
         cfg = feed_cfg_for(config, tag)
         if not cfg:
             return
         backup_feed_transcripts(tag, cfg)
+        backup_feed_diarizations(tag, cfg)
         prune_feed_mp3s(tag, cfg)
 
     total_pending = sum(len(p[2]) for p in plan)
