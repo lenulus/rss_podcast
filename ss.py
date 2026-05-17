@@ -798,9 +798,15 @@ class _PrefixedWriter:
         if not s:
             return 0
         self._buffer += s
+        flushed_any = False
         while "\n" in self._buffer:
             line, _, self._buffer = self._buffer.partition("\n")
             self.stream.write(self.prefix + line + "\n")
+            flushed_any = True
+        # Push each logical line out immediately so concurrent workers'
+        # progress is visible in the parent's merged log stream.
+        if flushed_any:
+            self.stream.flush()
         return len(s)
 
     def flush(self) -> None:
@@ -1783,12 +1789,18 @@ def _run_feed_via_subprocess(args, mp3_dir: Path, out_dir: Path,
     import subprocess
     from concurrent.futures import ThreadPoolExecutor, as_completed
     tag = mp3_dir.name
+    diarize_only = bool(getattr(args, "diarize_only", False))
+
+    # Different "done" signal per mode — see run_transcribe planning for the same split.
+    def is_done(stem: str) -> bool:
+        if diarize_only:
+            return (out_dir / ".diarize" / f"{stem}.json").exists()
+        return stem in load_processed(tag)
 
     # Snapshot the actually-pending set now and respect limit_remaining upfront.
     # Concurrency requires explicit per-worker --only assignment; doing it here
     # ahead of dispatch keeps the loop race-free.
-    existing = load_processed(tag)
-    pending = [f for f in to_process if f.stem not in existing]
+    pending = [f for f in to_process if not is_done(f.stem)]
     if limit_remaining is not None:
         pending = pending[:limit_remaining]
     total = len(pending)
@@ -1797,17 +1809,23 @@ def _run_feed_via_subprocess(args, mp3_dir: Path, out_dir: Path,
 
     concurrency = max(1, min(concurrency, total))
     mode_note = f"concurrency={concurrency}" if concurrency > 1 else "serial"
-    print(f"\n[{mp3_dir}] {total} mp3(s) → {out_dir}  (subprocess-per-episode, {mode_note})")
+    only_note = ", diarize-only" if diarize_only else ""
+    print(f"\n[{mp3_dir}] {total} mp3(s) → {out_dir}  (subprocess-per-episode, {mode_note}{only_note})")
 
     def child_cmd(mp3: Path, worker_id: int) -> list[str]:
+        # -u keeps the child's stdout unbuffered so its progress lines flow
+        # through to the parent's log immediately (without -u Python
+        # block-buffers stdout when it's a pipe, hiding worker progress).
         cmd = [
-            sys.executable, str(Path(__file__).resolve()),
+            sys.executable, "-u", str(Path(__file__).resolve()),
             "--config", args.config,
             "--feed", tag,
             "--transcribe",
             "--no-subprocess-per-episode",
             "--only", mp3.stem,
         ]
+        if diarize_only:
+            cmd.append("--diarize-only")
         if concurrency > 1:
             cmd.extend(["--label", f"[w{worker_id}]"])
         if args.diarize is not None:
@@ -1824,8 +1842,7 @@ def _run_feed_via_subprocess(args, mp3_dir: Path, out_dir: Path,
             result = subprocess.run(child_cmd(mp3, 1))
             if result.returncode != 0:
                 print(f"  ✗ Subprocess exited {result.returncode}.")
-            existing = load_processed(tag)
-            if mp3.stem not in existing:
+            if not is_done(mp3.stem):
                 print(f"  ✗ {mp3.name} still pending after subprocess. Aborting feed.")
                 break
             processed += 1
@@ -1851,8 +1868,7 @@ def _run_feed_via_subprocess(args, mp3_dir: Path, out_dir: Path,
             except Exception as e:
                 print(f"  ✗ [{idx}/{total}] {mp3.name} crashed: {e}")
                 continue
-            existing = load_processed(tag)
-            if mp3.stem not in existing:
+            if not is_done(mp3.stem):
                 print(f"  ✗ [{idx}/{total}] {mp3.name} still pending after subprocess.")
                 continue
             processed += 1
@@ -1864,6 +1880,7 @@ def run_transcribe(args):
     """Transcribe mp3 files using Lightning Whisper MLX (Apple Silicon GPU)."""
     pairs = transcribe_pairs(args)
     config = getattr(args, "_config", {}) or {}
+    diarize_only = bool(getattr(args, "diarize_only", False))
 
     # Pre-scan to figure out how many files we'd process — lets us skip model load if zero.
     plan: list[tuple[Path, Path, list[Path]]] = []
@@ -1878,7 +1895,12 @@ def run_transcribe(args):
         mp3s = sorted(mp3_dir.glob("*.mp3"))
         tag = mp3_dir.name
         feed_cfg = feed_cfg_for(config, tag)
-        if feed_cfg:
+        # Different "done" signal per mode: --diarize-only keys on the diarize
+        # cache file's existence; --transcribe keys on .processed entries.
+        if diarize_only:
+            existing = {p.stem for p in (out_dir / ".diarize").glob("*.json")} \
+                if (out_dir / ".diarize").is_dir() else set()
+        elif feed_cfg:
             existing = load_processed(tag)
         else:
             existing = {p.stem for p in out_dir.glob("*.md")} if out_dir.is_dir() else set()
@@ -1898,7 +1920,9 @@ def run_transcribe(args):
         batch_marker = f"  batch={pair_batch[tag]}" if pair_batch[tag] != 12 else ""
         model_marker = f"  model={pair_model[tag]}" if pair_model[tag] != "medium" else ""
         subproc_marker = "  ⊞ subprocess" if pair_subprocess[tag] else ""
-        print(f"  {mp3_dir}: {len(mp3s)} mp3(s), {len(existing)} transcribed, {len(to_process)} pending → {out_dir}{diar_marker}{batch_marker}{model_marker}{subproc_marker}")
+        only_marker = "  🜨 diarize-only" if diarize_only else ""
+        done_label = "diarized" if diarize_only else "transcribed"
+        print(f"  {mp3_dir}: {len(mp3s)} mp3(s), {len(existing)} {done_label}, {len(to_process)} pending → {out_dir}{diar_marker}{batch_marker}{model_marker}{subproc_marker}{only_marker}")
 
     def post_process(mp3_dir: Path):
         """Run transcript backup + mp3 pruning for a finished feed dir."""
@@ -1950,33 +1974,37 @@ def run_transcribe(args):
             total_done += done
             post_process(mp3_dir)
             if args.limit and total_done >= args.limit:
+                done_verb = "diarized" if diarize_only else "transcribed"
                 print(f"\nLimit of {args.limit} reached.")
-                print(f"\nDone. {total_done} file(s) transcribed.")
+                print(f"\nDone. {total_done} file(s) {done_verb}.")
                 return
             continue
 
-        # Lazy-load Whisper for in-process feeds only.
-        from lightning_whisper_mlx import LightningWhisperMLX
-
+        # Lazy-load Whisper for in-process feeds only — skipped in --diarize-only
+        # mode since we never call into Whisper.
         desired_batch = pair_batch.get(mp3_dir.name, 12)
         desired_model = pair_model.get(mp3_dir.name, "medium")
-        if whisper is None or last_batch != desired_batch or last_model != desired_model:
-            print(f"Loading model '{desired_model}' (batch_size={desired_batch})...")
-            whisper = LightningWhisperMLX(model=desired_model, batch_size=desired_batch, quant=None)
-            last_batch = desired_batch
-            last_model = desired_model
+        if not diarize_only:
+            from lightning_whisper_mlx import LightningWhisperMLX
+            if whisper is None or last_batch != desired_batch or last_model != desired_model:
+                print(f"Loading model '{desired_model}' (batch_size={desired_batch})...")
+                whisper = LightningWhisperMLX(model=desired_model, batch_size=desired_batch, quant=None)
+                last_batch = desired_batch
+                last_model = desired_model
 
         print(f"\n[{mp3_dir}] {len(to_process)} mp3(s) → {out_dir}")
 
         for i, mp3_path in enumerate(to_process, 1):
             if args.limit and total_done >= args.limit:
+                done_verb = "diarized" if diarize_only else "transcribed"
                 print(f"\nLimit of {args.limit} reached.")
                 post_process(mp3_dir)
-                print(f"\nDone. {total_done} file(s) transcribed.")
+                print(f"\nDone. {total_done} file(s) {done_verb}.")
                 return
 
             # Re-hydrate models if a periodic reload nuked them. Cheap when not needed.
-            if whisper is None:
+            if not diarize_only and whisper is None:
+                from lightning_whisper_mlx import LightningWhisperMLX
                 print(f"  ↻ Reloading Whisper '{desired_model}' (batch_size={desired_batch})...")
                 whisper = LightningWhisperMLX(model=desired_model, batch_size=desired_batch, quant=None)
                 last_batch = desired_batch
@@ -1989,7 +2017,7 @@ def run_transcribe(args):
             audio_dur = get_audio_duration_secs(mp3_path)
             dur_str = format_duration(str(int(audio_dur))) if audio_dur else "??:??"
             do_diarize = want_diarize and diarization_pipeline is not None
-            mode_marker = " (with diarization)" if do_diarize else ""
+            mode_marker = " (diarize-only)" if diarize_only else (" (with diarization)" if do_diarize else "")
             print(f"  [{i}/{len(to_process)}] Transcribing{mode_marker} ({dur_str}): {mp3_path.name}")
 
             speaker_turns = None
@@ -2010,6 +2038,15 @@ def run_transcribe(args):
                         n_speakers = len(set(t[2] for t in speaker_turns))
                         print(f"    ✓ Diarized in {time.time() - t_d:.1f}s — {n_speakers} speaker(s), {len(speaker_turns)} turn(s)")
                         save_diarization_cache(mp3_path, out_dir, speaker_turns)
+
+            if diarize_only:
+                # Diarize-only mode: cache is written above; skip Whisper, rendering,
+                # .md write, and .processed append entirely. The cache file is the
+                # done-signal — a later --transcribe will pick it up automatically.
+                total_done += 1
+                speaker_turns = None
+                _release_memory()
+                continue
 
             t0 = time.time()
             result = transcribe_chunked(mp3_path, whisper, checkpoint_dir=out_dir / ".chunks")
@@ -2071,7 +2108,8 @@ def run_transcribe(args):
 
         post_process(mp3_dir)
 
-    print(f"\nDone. {total_done} file(s) transcribed.")
+    done_verb = "diarized" if diarize_only else "transcribed"
+    print(f"\nDone. {total_done} file(s) {done_verb}.")
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
@@ -2102,6 +2140,13 @@ def main():
                              "Runs each episode in a fresh Python process to isolate MPS "
                              "allocator state; trades ~30-60s model-load overhead per episode "
                              "for predictable, bounded per-episode cost on long backlogs.")
+    parser.add_argument("--diarize-only", action="store_true",
+                        help="Run only the pyannote diarization stage; skip Whisper. "
+                             "Writes .diarize/<stem>.json cache files so a later --transcribe "
+                             "is Whisper-only. Pairs naturally with --subprocess-concurrency N "
+                             "since pyannote's working set (~5 GB) is far smaller than Whisper's "
+                             "(up to ~50 GB for large-v3), making N concurrent diarize workers "
+                             "safe where N concurrent transcribes would OOM.")
     parser.add_argument("--subprocess-concurrency", type=int, default=None,
                         help="Max concurrent transcribe subprocesses for one feed "
                              "(overrides feeds.toml). Only meaningful with "
@@ -2156,7 +2201,7 @@ def main():
         run_backfill_headers(args)
         return
 
-    if args.transcribe:
+    if args.transcribe or args.diarize_only:
         run_transcribe(args)
         return
 

@@ -30,6 +30,7 @@ Operating reference for `./run.sh` — designed for Claude (or other automated a
 | Bulk pre-download (e.g. on unmetered) | `./run.sh --feed <tag> --download --no-limit` | full feed size | hours |
 | Transcribe everything pending | `./run.sh --transcribe` | none | hours |
 | Transcribe one feed | `./run.sh --feed <tag> --transcribe` | none | hours |
+| Pre-diarize a feed at high concurrency, then transcribe later | `./run.sh --feed <tag> --diarize-only --subprocess-concurrency 6` then `./run.sh --feed <tag> --transcribe` | none | hours |
 | Add metadata + chapter headings to old transcripts | `./run.sh --backfill-headers` | RSS only | seconds |
 | List episodes in a feed (tabular) | `./run.sh --feed <tag> --index [--limit N]` | RSS only | seconds |
 | Force diarization on/off for one run | `... --diarize` or `... --no-diarize` | — | — |
@@ -109,6 +110,25 @@ A bulk pre-download or full backfill should always be preceded by `--check` to s
 | Backfill headers | ~1s per file (RSS-bound) | — |
 
 Whisper model size scales linearly: `large-v3` ≈ 2× the time of `medium`, `small` ≈ 0.5× — quality / speed trade-off.
+
+## Two-pass diarize-then-transcribe for high concurrency
+
+Diarize and Whisper have wildly different memory profiles:
+
+- **Pyannote** (diarize): ~5 GB working set per process. Safely parallelizable to 4–8 workers on a 64 GB Mac.
+- **Whisper-large-v3 at batch=48** (transcribe): can burst to ~50 GB per process. Effective max concurrency = 1 (two simultaneous bursts can collide and trigger heavy swap or OOM).
+
+When both stages run in one subprocess (`--transcribe`), per-feed concurrency is bounded by Whisper's burst. To use the idle GPU/CPU during diarize, split the workload:
+
+```bash
+# Pass 1: fast parallel pyannote (cache fills the .diarize/ sidecars)
+./run.sh --feed <tag> --diarize-only --subprocess-concurrency 6
+
+# Pass 2: serial Whisper (every episode reads from the diarize cache)
+./run.sh --feed <tag> --transcribe
+```
+
+`--diarize-only` writes only the `.diarize/<stem>.json` cache file and does NOT append to `.processed` — the cache file is the done-signal. The follow-up `--transcribe` is Whisper-only and runs at full per-episode speed without contention.
 
 ## Gotchas
 
