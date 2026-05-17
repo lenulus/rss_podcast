@@ -2,6 +2,36 @@
 
 Operating reference for `./run.sh` — designed for Claude (or other automated agents) to use this tool reliably without burning bandwidth, transcribe time, or destroying state. For end-user onboarding see `README.md`.
 
+## Recommended configuration (Apple Silicon, 64 GB)
+
+For a multi-host / panel-style feed with a backlog of more than ~20 episodes on M2 Ultra (or equivalent 64 GB Apple Silicon), use this per-feed config plus the two-pass workflow below. See [Two-pass diarize-then-transcribe](#two-pass-diarize-then-transcribe-for-high-concurrency) for the architectural reasoning.
+
+```toml
+[feeds.<tag>]
+rss = "..."
+diarize = true
+model = "large-v3"
+whisper_batch_size = 48
+subprocess_per_episode = true
+```
+
+```bash
+# Phase 1 — fast parallel pyannote (fills .diarize/<stem>.json cache)
+./run.sh --feed <tag> --diarize-only --subprocess-concurrency 10
+
+# Phase 2 — serial Whisper-only (every episode hits the cache)
+./run.sh --feed <tag> --transcribe
+```
+
+**Don't:**
+- Run Whisper with `--subprocess-concurrency > 1` — Whisper-large-v3 at batch=48 bursts to ~50 GB; two simultaneous bursts will OOM or thrash swap.
+- Run phase 1 and phase 2 concurrently — same memory ceiling (50 GB Whisper + ~25 GB diarize pool > 64 GB).
+- Use the in-process loop (`subprocess_per_episode = false`) on backlogs > ~20 episodes — MPS allocator drift causes per-episode slowdown that the 5-ep periodic reload only partially clears.
+
+**Exception:** for catch-up runs of 1–5 episodes, skip subprocess mode entirely. The ~30s-per-episode model-load overhead doesn't pay back at that scale; in-process is faster.
+
+**Smaller machines (e.g. M1 Pro 32 GB):** drop `whisper_batch_size` to 12–16 (large Whisper bursts won't fit), and `--subprocess-concurrency` to 4–6 (proportional to memory headroom). Same code, different knob values.
+
 ## State map (where everything lives)
 
 | Path | Owner | What |
