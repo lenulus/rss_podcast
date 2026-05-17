@@ -145,13 +145,140 @@ def _parse_urlset(body: str, path_filter: str) -> list[tuple[str, str, str]]:
     return out
 
 
-def discover(source_cfg: dict) -> list[tuple[str, str, str]]:
+def discover(source_cfg: dict) -> list[tuple]:
+    """Unified discovery dispatch.
+
+    Returns [(url, published_iso, title, payload), …] where `payload` is None
+    for RSS/sitemap sources (body fetched later via trafilatura) and a
+    normalized dict for hf-daily-papers (body already in hand from the JSON
+    API, no per-article fetch needed).
+    """
     t = source_cfg.get("type", "").lower()
     if t == "rss":
-        return discover_rss(source_cfg)
+        return [(u, d, ti, None) for u, d, ti in discover_rss(source_cfg)]
     if t == "sitemap":
-        return discover_sitemap(source_cfg)
+        return [(u, d, ti, None) for u, d, ti in discover_sitemap(source_cfg)]
+    if t == "hf-daily-papers":
+        return discover_hf_papers(source_cfg)
     raise ValueError(f"Unknown source type: {t!r}")
+
+
+# ── Hugging Face Daily Papers ────────────────────────────────────────────────
+
+HF_API_DAILY = "https://huggingface.co/api/daily_papers"
+HF_API_PAPER = "https://huggingface.co/api/papers/{arxiv_id}"
+HF_HTML_WEEKLY = "https://huggingface.co/papers/week/{week}"
+
+
+def _fetch_hf_daily_api() -> list[dict]:
+    """GET /api/daily_papers — returns the most-recent 50 curated papers."""
+    headers = {"User-Agent": DEFAULT_USER_AGENT, "Accept": "application/json"}
+    r = requests.get(HF_API_DAILY, headers=headers, timeout=HTTP_TIMEOUT)
+    r.raise_for_status()
+    return r.json()
+
+
+def _fetch_hf_weekly() -> list[dict]:
+    """Enumerate this week's papers via HTML, hydrate each via per-paper JSON API.
+
+    The weekly HTML page lists arxiv IDs for the curated week (~105 papers);
+    each is fetched via /api/papers/<id> for the structured payload. Same
+    extraction quality as the daily API, broader date window per poll.
+    """
+    now = datetime.now()
+    iso_year, iso_week, _ = now.isocalendar()
+    week_str = f"{iso_year}-W{iso_week:02d}"
+    headers = {"User-Agent": DEFAULT_USER_AGENT}
+    r = requests.get(HF_HTML_WEEKLY.format(week=week_str), headers=headers, timeout=HTTP_TIMEOUT)
+    r.raise_for_status()
+    arxiv_ids = sorted(set(re.findall(r"/papers/(\d+\.\d+)", r.text)))
+    out: list[dict] = []
+    for arxiv_id in arxiv_ids:
+        try:
+            pr = requests.get(
+                HF_API_PAPER.format(arxiv_id=arxiv_id),
+                headers={"User-Agent": DEFAULT_USER_AGENT, "Accept": "application/json"},
+                timeout=HTTP_TIMEOUT,
+            )
+            pr.raise_for_status()
+            out.append(pr.json())
+        except Exception as e:
+            print(f"    ⚠ per-paper fetch failed for {arxiv_id}: {e}")
+        time.sleep(0.3)
+    return out
+
+
+def _normalize_hf_paper(raw: dict) -> dict:
+    """Flatten daily-feed or per-paper-API responses into one uniform shape.
+
+    Daily feed items wrap the paper metadata inside a `paper:` key and add
+    denormalized title/summary/publishedAt at the top level. The per-paper
+    API returns the inner shape directly. Both produce the same flat dict
+    here so downstream code doesn't branch.
+    """
+    paper = raw.get("paper") if isinstance(raw.get("paper"), dict) else raw
+    sub_by = paper.get("submittedOnDailyBy") or {}
+    org = paper.get("organization") or {}
+    return {
+        "arxiv_id": paper.get("id", ""),
+        "title": (paper.get("title") or "").strip(),
+        "authors": [a.get("name", "").strip() for a in paper.get("authors", []) if a.get("name")],
+        "summary": (paper.get("summary") or "").strip(),
+        "ai_summary": (paper.get("ai_summary") or "").strip(),
+        "ai_keywords": [k.strip() for k in paper.get("ai_keywords", []) if k and k.strip()],
+        "upvotes": int(paper.get("upvotes") or 0),
+        "published_at": paper.get("publishedAt", "") or "",
+        "submitted_on_daily_at": paper.get("submittedOnDailyAt", "") or "",
+        "submitted_by": (sub_by.get("name") or sub_by.get("fullname") or "").strip(),
+        "project_page": (paper.get("projectPage") or "").strip(),
+        "organization": (org.get("fullname") or org.get("name") or "").strip(),
+        "discussion_id": (paper.get("discussionId") or "").strip(),
+    }
+
+
+def discover_hf_papers(source_cfg: dict) -> list[tuple]:
+    """Returns [(url, published_iso, title, payload_dict), …].
+
+    Applies `min_upvotes` filter and `top_n` cap before returning. Filtered
+    papers are NOT in the returned list, so they don't get appended to
+    .processed and will be re-evaluated on the next poll against the (possibly
+    updated) upvote count.
+
+    Sort key: upvotes DESC, then submittedOnDailyAt DESC (Python's stable sort
+    is leveraged — apply secondary key first, then primary).
+    """
+    mode = source_cfg.get("discovery_mode", "daily-api")
+    if mode == "daily-api":
+        raw_list = _fetch_hf_daily_api()
+    elif mode == "weekly-html":
+        raw_list = _fetch_hf_weekly()
+    else:
+        raise ValueError(f"Unknown discovery_mode: {mode!r} (use 'daily-api' or 'weekly-html')")
+
+    normalized = [_normalize_hf_paper(r) for r in raw_list]
+
+    min_upvotes = int(source_cfg.get("min_upvotes", 0) or 0)
+    if min_upvotes > 0:
+        before = len(normalized)
+        normalized = [p for p in normalized if p["upvotes"] >= min_upvotes]
+        print(f"    filtered by min_upvotes={min_upvotes}: {before} → {len(normalized)}")
+
+    # Stable sort: secondary key first (submittedOnDailyAt DESC), then primary (upvotes DESC).
+    normalized.sort(key=lambda p: p["submitted_on_daily_at"] or "", reverse=True)
+    normalized.sort(key=lambda p: p["upvotes"], reverse=True)
+
+    top_n = source_cfg.get("top_n")
+    if top_n:
+        normalized = normalized[: int(top_n)]
+        print(f"    capped by top_n={top_n}: keeping {len(normalized)}")
+
+    out: list[tuple] = []
+    for p in normalized:
+        if not p["arxiv_id"]:
+            continue
+        url = f"https://huggingface.co/papers/{p['arxiv_id']}"
+        out.append((url, p["published_at"], p["title"], p))
+    return out
 
 
 # ── Article fetch + extract ───────────────────────────────────────────────────
@@ -272,6 +399,77 @@ def render_article(source: str, url: str, body: str, meta: dict,
     return out_path, content, published_iso
 
 
+def _slug_from_text(s: str, limit: int = 60) -> str:
+    """lowercase, hyphenate non-alphanumerics, cap to `limit` chars. Used for paper titles."""
+    safe = re.sub(r"[^a-z0-9-]+", "-", s.lower()).strip("-")
+    return safe[:limit] or "untitled"
+
+
+def render_hf_paper(source: str, payload: dict) -> tuple[Path, str, str]:
+    """Render an HF Daily Papers entry to markdown.
+
+    Differs from render_article in two ways: no trafilatura body (we already
+    have the structured payload), and the frontmatter is `type: paper` with
+    arxiv-specific fields (arxiv_id, project_page, authors list, organization,
+    upvotes, ai_keywords as tags).
+    """
+    fetched_iso = datetime.now(timezone.utc).isoformat()
+    arxiv_id = payload["arxiv_id"]
+    date_prefix, published_iso = normalize_date(payload.get("published_at", ""))
+    _, submitted_iso = normalize_date(payload.get("submitted_on_daily_at", ""))
+
+    title_slug = _slug_from_text(payload["title"] or arxiv_id)
+    filename = f"{date_prefix} - {arxiv_id} - {title_slug}.md"
+    out_path = Path(f"./news/{source}/{filename}")
+
+    fm_lines = [
+        "---",
+        f'title: "{escape_yaml(payload["title"])}"',
+        "type: paper",
+        f"source: {source}",
+        f"arxiv_id: {arxiv_id}",
+        f"arxiv_url: https://arxiv.org/abs/{arxiv_id}",
+        f"hf_url: https://huggingface.co/papers/{arxiv_id}",
+    ]
+    if payload.get("project_page"):
+        fm_lines.append(f"project_page: {payload['project_page']}")
+    fm_lines.append(f"published: {published_iso}" if published_iso else "published:")
+    if submitted_iso:
+        fm_lines.append(f"submitted_to_hf: {submitted_iso}")
+    fm_lines.append(f"fetched: {fetched_iso}")
+
+    if payload["authors"]:
+        fm_lines.append("authors:")
+        for a in payload["authors"]:
+            fm_lines.append(f'  - "{escape_yaml(a)}"')
+    else:
+        fm_lines.append("authors: []")
+    if payload.get("organization"):
+        fm_lines.append(f'organization: "{escape_yaml(payload["organization"])}"')
+    if payload.get("submitted_by"):
+        fm_lines.append(f'submitted_by: "{escape_yaml(payload["submitted_by"])}"')
+    fm_lines.append(f"upvotes: {payload['upvotes']}")
+
+    # Tags: literal "paper" first, then ai_keywords slugified
+    fm_lines.append("tags:")
+    fm_lines.append("  - paper")
+    for kw in payload.get("ai_keywords", []):
+        slug = _slug_from_text(kw, limit=50)
+        if slug and slug != "untitled":
+            fm_lines.append(f"  - {slug}")
+    fm_lines.append("---")
+    fm_lines.append("")
+
+    body_parts = [f"# {payload['title']}", ""]
+    if payload.get("ai_summary"):
+        body_parts.extend(["## TL;DR (HF auto-summary)", "", payload["ai_summary"], ""])
+    if payload.get("summary"):
+        body_parts.extend(["## Abstract", "", payload["summary"], ""])
+
+    content = "\n".join(fm_lines) + "\n".join(body_parts).rstrip() + "\n"
+    return out_path, content, published_iso
+
+
 # ── Backup ────────────────────────────────────────────────────────────────────
 
 def backup_source(source: str, defaults: dict, source_cfg: dict) -> None:
@@ -334,39 +532,49 @@ def process_source(source: str, source_cfg: dict, defaults: dict,
         return
     print(f"  discovered: {len(discovered)} URL(s)")
     seen = load_processed(source)
-    pending = [(url, date, title) for url, date, title in discovered if url not in seen]
+    pending = [t for t in discovered if t[0] not in seen]
     print(f"  pending (not in .processed): {len(pending)}")
     if not pending:
         return
-    # Sort newest first so the freshest articles land first; useful when --limit caps.
-    pending.sort(key=lambda x: x[1] or "", reverse=True)
+    # For RSS/sitemap, sort newest first by lastmod/published date. For HF papers,
+    # discover_hf_papers already sorted by (upvotes DESC, submittedOnDailyAt DESC),
+    # so don't re-sort and lose that ordering.
+    if source_cfg.get("type") != "hf-daily-papers":
+        pending.sort(key=lambda x: x[1] or "", reverse=True)
     if limit:
         pending = pending[:limit]
         print(f"  capped to {limit} for this run")
 
     if check_only:
-        for url, date, title in pending[:20]:
+        for url, date, title, _payload in pending[:20]:
             print(f"    [{date or '?':<10}] {url}")
         if len(pending) > 20:
             print(f"    … and {len(pending) - 20} more")
         return
 
     written = 0
-    for i, (url, discovery_date, title_hint) in enumerate(pending, 1):
+    for i, (url, discovery_date, title_hint, payload) in enumerate(pending, 1):
         print(f"\n  [{i}/{len(pending)}] {url}")
-        extracted = fetch_and_extract(url)
-        if not extracted:
-            time.sleep(delay)
-            continue
-        body, meta = extracted
-        if not meta.get("title") and title_hint:
-            meta["title"] = title_hint
-        out_path, content, published = render_article(source, url, body, meta, discovery_date)
+        if payload is not None:
+            # HF paper path: payload carries the full normalized JSON already;
+            # no per-article fetch + trafilatura step.
+            out_path, content, published = render_hf_paper(source, payload)
+            body_len = len(payload.get("summary", "") or "") + len(payload.get("ai_summary", "") or "")
+        else:
+            extracted = fetch_and_extract(url)
+            if not extracted:
+                time.sleep(delay)
+                continue
+            body, meta = extracted
+            if not meta.get("title") and title_hint:
+                meta["title"] = title_hint
+            out_path, content, published = render_article(source, url, body, meta, discovery_date)
+            body_len = len(body)
         out_path.parent.mkdir(parents=True, exist_ok=True)
         out_path.write_text(content, encoding="utf-8")
         record_processed(source, url)
         written += 1
-        print(f"    ✓ wrote {out_path.name} (published={published or '?'}, {len(body)} chars)")
+        print(f"    ✓ wrote {out_path.name} (published={published or '?'}, {body_len} chars)")
         time.sleep(delay)
     print(f"\n  [{source}] wrote {written} new article(s).")
     backup_source(source, defaults, source_cfg)
