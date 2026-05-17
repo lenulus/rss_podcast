@@ -113,7 +113,35 @@ If the daily-API-only mode misses a paper that was curated 5 days ago (the API r
 
 If the user wants both — set up the source twice with different slugs and `discovery_mode` values — but for v1 picking one is fine.
 
-### 4. Wiki integration via frontmatter shape
+### 4. Quality filtering via `min_upvotes` and `top_n`
+
+50 papers/day raw is too noisy for wiki ingestion. Two complementary filters resolve this without losing signal:
+
+- **`min_upvotes`** — drop any paper below the threshold at fetch time. Cheap signal of community endorsement; the long tail of submitted-but-ignored papers gets filtered.
+- **`top_n`** — after filtering by upvotes, keep only the top N by upvotes (tie-break on `submittedOnDailyAt` descending). Caps daily ingest volume even when many papers cross the upvote bar.
+
+Both are optional and combinable:
+
+```toml
+[sources.hf-papers]
+min_upvotes = 10   # only papers with ≥10 community upvotes
+top_n = 5          # of those, keep the 5 best per poll
+```
+
+Sort key: `(upvotes DESC, submittedOnDailyAt DESC)`. Stable across polls.
+
+**Crucial detail — defer the `.processed` write for filtered papers.** A paper polled on Monday with 3 upvotes should be re-checked Tuesday if it's grown to 12 — not silently skipped. Implementation:
+
+- Papers that pass filters → render to `.md`, append URL to `.processed`. Standard path.
+- Papers that fail filters → **no `.md`, no `.processed` entry**. They reappear in the next poll's discovery list and get re-evaluated against the (possibly updated) upvote count.
+
+Automatic stale handling: the `/api/daily_papers` endpoint returns the most-recent 50, so any paper that never gains enough upvotes falls off the feed within ~2 weeks naturally. No explicit aging logic needed.
+
+For the weekly-HTML mode the same logic applies, but the window is longer (~7 days × ~15 papers/day ≈ 105). Re-checking a single Monday-filtered paper for 7 days of weekly polls is fine.
+
+Edge case: a paper that's already-ingested but then loses upvotes (rare, but possible if the post is withdrawn). v1 ignores this — once a paper is in `.processed` we keep it. The wiki layer can do its own quality re-curation downstream.
+
+### 5. Wiki integration via frontmatter shape
 
 Frontmatter matches the `type: paper` convention so the wiki ingest path (per `CLAUDE.md`) can pick these up alongside `type: source` (transcripts) and `type: article` (news). Each paper is treated as a primary research source.
 
@@ -125,11 +153,18 @@ Frontmatter matches the `type: paper` convention so the wiki ingest path (per `C
 [sources.hf-papers]
 type = "hf-daily-papers"
 discovery_mode = "daily-api"        # or "weekly-html"
+min_upvotes = 10                    # community-endorsement floor (optional)
+top_n = 5                           # per-poll cap after sorting (optional)
 # fetch_delay_seconds inherits from [defaults]; HF API is fast, 0.5s is fine
 fetch_delay_seconds = 0.5
 ```
 
 For weekly polling without the wider window, the user just runs the ingestor weekly via cron without changing this config — the dedup index does its job.
+
+Realistic defaults to consider:
+- `min_upvotes = 5` (loose) — captures community-endorsed papers, filters the long tail. Likely 5–10 papers/day post-filter.
+- `min_upvotes = 10, top_n = 5` (tight) — only the day's standouts. 0–5 papers/day post-filter.
+- No filters (raw) — 10–20 papers/day, suitable for archival operators.
 
 ## Output
 
@@ -182,14 +217,15 @@ however, concentrate in thin spherical shells, and a ...
 
 ## Implementation scope
 
-~120 lines added to `news.py`:
+~150 lines added to `news.py`:
 
-- `discover_hf_daily_papers(cfg)` — GET `/api/daily_papers`, normalize into the existing `(url, date, title, payload)` shape (the payload carries the JSON for later render).
-- `discover_hf_weekly_papers(cfg)` — fetch weekly HTML, extract arxiv IDs, GET each via `/api/papers/<id>`, return the same tuple shape.
+- `discover_hf_daily_papers(cfg)` — GET `/api/daily_papers`, apply `min_upvotes` filter, sort by `(upvotes DESC, submittedOnDailyAt DESC)`, take `top_n` if set, normalize into the existing `(url, date, title, payload)` shape (the payload carries the JSON for later render).
+- `discover_hf_weekly_papers(cfg)` — fetch weekly HTML, extract arxiv IDs, GET each via `/api/papers/<id>`, apply the same filter+sort+cap, return the same tuple shape.
 - `render_hf_paper(payload)` — JSON → markdown with the frontmatter above. Different from `render_article` because we don't run trafilatura.
 - Dispatcher tweak in `process_source` so `type = "hf-daily-papers"` skips `fetch_and_extract` and uses the pre-fetched payload.
+- Filtered papers do NOT get appended to `.processed` — they get re-evaluated on the next poll against the (possibly updated) upvote count.
 
-CLI unchanged: `./news.sh --source hf-papers --check` (preview), `--source hf-papers` (ingest), `--limit N` (cap).
+CLI unchanged: `./news.sh --source hf-papers --check` (preview, shows what'd pass the filter), `--source hf-papers` (ingest), `--limit N` (additional per-run cap layered on top of `top_n`).
 
 ## Open questions
 
