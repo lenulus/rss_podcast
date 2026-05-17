@@ -32,7 +32,11 @@ url = "https://research.google/blog/rss"
 
 [sources.google-keyword]
 type = "rss"
-url = "https://blog.google/rss"
+# AI-specific subfeed (filters out the generic Keyword noise like Brandcast,
+# Es Devlin art posts, etc.). The bare /rss/ endpoint includes everything
+# Google publishes; this subfeed filters to AI/Gemini consumer-product
+# rollouts which complement DeepMind (research) and Google Research (academic).
+url = "https://blog.google/technology/ai/rss/"
 
 # ── Sources with no RSS — discovery via sitemap.xml ──────────────────────────
 
