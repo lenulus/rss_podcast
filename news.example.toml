@@ -45,6 +45,21 @@ type = "rss"
 url = "https://www.latent.space/feed?sectionId=327741"
 # sid = "s%3A..."   # connect.sid cookie from www.latent.space; unlocks paid bodies
 
+# Alternative discovery for Substack sections: the paginated archive API.
+# RSS caps at 20 most-recent entries; the archive endpoint paginates the
+# full history. Useful for backfilling beyond the RSS rolling window, and
+# also works as the ongoing discovery method (dedup makes re-polls O(new)).
+# Swap the section's [sources.<slug>] block to use this type when you want
+# the full backlog; same slug means it shares the .processed dedup index
+# with whatever was already ingested via RSS.
+#
+# [sources.latent-space-ainews]
+# type = "substack-section-archive"
+# base_url = "https://www.latent.space"
+# section_id = 327741
+# sid = "s%3A..."         # connect.sid cookie; required for paid-tier posts
+# min_date = "2026-01-01" # optional ISO date floor; archive walks newest-first
+
 [sources.google-keyword]
 type = "rss"
 # AI-specific subfeed (filters out the generic Keyword noise like Brandcast,

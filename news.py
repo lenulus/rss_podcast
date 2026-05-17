@@ -160,7 +160,63 @@ def discover(source_cfg: dict) -> list[tuple]:
         return [(u, d, ti, None) for u, d, ti in discover_sitemap(source_cfg)]
     if t == "hf-daily-papers":
         return discover_hf_papers(source_cfg)
+    if t == "substack-section-archive":
+        return discover_substack_archive(source_cfg)
     raise ValueError(f"Unknown source type: {t!r}")
+
+
+# ── Substack section archive ─────────────────────────────────────────────────
+
+def discover_substack_archive(source_cfg: dict) -> list[tuple]:
+    """Paginate /api/v1/archive for a Substack section. Returns full backlog.
+
+    Unlike RSS (capped at 20 most-recent), the archive endpoint paginates
+    through the entire history. Useful for one-time backfills and as the
+    primary discovery method going forward — dedup via .processed makes
+    re-polling cheap (only newly-published posts get fetched).
+
+    Required config fields:
+      base_url    — publication root, e.g. "https://www.latent.space"
+      section_id  — numeric section id from /s/<slug> page <link rel=alternate>
+
+    Optional:
+      sid         — connect.sid cookie for paid-tier posts
+      min_date    — ISO date floor (e.g. "2026-01-01"); skip older entries
+    """
+    base_url = source_cfg["base_url"].rstrip("/")
+    section_id = source_cfg["section_id"]
+    sid = source_cfg.get("sid")
+    min_date = (source_cfg.get("min_date") or "").strip()
+
+    headers = {"User-Agent": DEFAULT_USER_AGENT, "Accept": "application/json"}
+    cookies = {"connect.sid": sid} if sid else {}
+    page_size = 20
+    out: list[tuple] = []
+    offset = 0
+    while True:
+        url = (f"{base_url}/api/v1/archive"
+               f"?sort=new&search=&offset={offset}&limit={page_size}"
+               f"&section_id={section_id}")
+        r = requests.get(url, headers=headers, cookies=cookies, timeout=HTTP_TIMEOUT)
+        r.raise_for_status()
+        data = r.json()
+        if not data:
+            break
+        for post in data:
+            slug = (post.get("slug") or "").strip()
+            canonical = (post.get("canonical_url") or "").strip() or f"{base_url}/p/{slug}"
+            post_date = (post.get("post_date") or "")[:25]
+            if min_date and post_date and post_date[:10] < min_date:
+                # Posts come newest-first; once we drop below min_date,
+                # the rest of the archive is older still — stop paginating.
+                return out
+            title = (post.get("title") or "").strip()
+            out.append((canonical, post_date, title, None))
+        if len(data) < page_size:
+            break
+        offset += page_size
+        time.sleep(0.3)
+    return out
 
 
 # ── Hugging Face Daily Papers ────────────────────────────────────────────────
