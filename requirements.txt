@@ -1,6 +1,11 @@
 feedparser
 requests
 
+# News ingestion (news.py) — article body + metadata extraction from arbitrary
+# HTML. Battle-tested across thousands of sites; handles boilerplate stripping,
+# canonical date discovery, and markdown output.
+trafilatura
+
 # lightning-whisper-mlx is installed with --no-deps in setup.sh because it
 # hard-pins tiktoken==0.3.3, which has no wheels past Python 3.11. Its
 # runtime deps are listed here with looser bounds so they resolve normally.

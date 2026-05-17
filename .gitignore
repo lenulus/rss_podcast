@@ -11,11 +11,13 @@
 downloads/
 mlx_models/
 transcripts/
+news/
 
 # Environment
 .env
 .env.*
 feeds.toml
+news.toml
 
 # Python
 __pycache__/

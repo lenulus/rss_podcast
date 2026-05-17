@@ -172,6 +172,40 @@ When both stages run in one subprocess (`--transcribe`), per-feed concurrency is
 - **Sidecar files (`.processed`, `.chunks/`, `.meta.json`) are not committed to git** — `transcripts/` and `downloads/` are gitignored in their entirety. Don't expect them to survive a fresh clone; the `.processed` index bootstraps from existing `.md` files on first run. **Exception: `.diarize/<stem>.json` is mirrored to the SD card backup** (`<text_dir>/.diarize/`) on every `--transcribe` / `--diarize-only` pass, so a re-clone with the SD card mounted recovers the diarize cache and avoids re-paying that compute.
 - **Background tasks during downloads should NOT touch `./downloads/<tag>/`** — the dedup check happens at start, but new files arriving mid-run could fool the skip logic.
 
+## News ingestion (`news.py`)
+
+Peer to `ss.py` for pulling article text from AI-company news feeds and blogs. Same conventions: TOML config (`news.toml`, gitignored), `.processed` dedup, mtime-aware SD-card backup. Different concerns: HTML article extraction via `trafilatura`, discovery from RSS feeds or sitemap.xml.
+
+**Layout** (parallel to `transcripts/`):
+
+```
+news/<source>/YYYY-MM-DD - <slug>.md          # one article per file, full body
+news/<source>/.processed                      # canonical dedup (URLs, append-only)
+<backup_path>/news/<source>/text/*.md         # SD-card mirror, namespaced under news/
+```
+
+**Wrapper:** `./news.sh` (mirrors `./run.sh` — venv + ffmpeg PATH + SSL_CERT_FILE export).
+
+**Commands:**
+
+| Want to … | Command |
+|---|---|
+| First-time setup: copy example, edit, ingest | `cp news.example.toml news.toml && ./news.sh --source <slug> --limit 1` |
+| Ingest one source's full backlog | `./news.sh --source <slug>` |
+| Ingest every configured source | `./news.sh --all` |
+| Preview new URLs without fetching | `./news.sh --source <slug> --check` |
+| Cap how many articles per source this run | `./news.sh --source <slug> --limit N` |
+| Per-source counts + last-fetched timestamp | `./news.sh --status` |
+
+**Source types in `news.toml`:**
+
+- `type = "rss"` — feedparser-driven (OpenAI, DeepMind, Google Research, Google Keyword).
+- `type = "sitemap"` — `<loc>`/`<lastmod>` parsing with `path_filter = "/news/"` or `"/blog/"` (Anthropic, Mistral, xAI, Cohere, AI21).
+
+Both paths normalize to `(url, lastmod_iso)` tuples; the rest of the pipeline (fetch → trafilatura extract → markdown render → dedup append) is shared.
+
+**Body extraction:** `trafilatura` handles boilerplate stripping, byline + date pulling, and markdown formatting. RSS summary fields are ignored — the article URL is always fetched for full body, since "summary-only" RSS gives short excerpts not full posts.
+
 ## When committing changes
 
 Commits in this repo follow:
