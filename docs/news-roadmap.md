@@ -42,6 +42,21 @@ These are written but unverified in production. Each should land a sample artifa
 
 **Suggested first pass:** `./news.sh --all --limit 1` once. That exercises 7 of the 8 rows above in one shot. Then go back and hand-review the 9 produced `.md` files for extraction quality issues.
 
+## Known limitations
+
+### Cohere — Cloudflare bot protection
+
+Smoke-test (`b1126o600`, 2026-05-17) discovered the issue. Sitemap discovery works fine (Cloudflare allows `sitemap.xml`), but each per-article fetch gets the JS challenge page. Trafilatura's fetcher squeezes past partially but extracts only the title (twice), reading-time stamp (twice), and one intro sentence — ~400 chars of content for what should be a 7-minute-read article. Vanilla `requests` gets HTTP 403 outright.
+
+`robots.txt` allows `/blog/*`, so the restriction is technical, not policy.
+
+Disabled in `news.toml` / `news.example.toml` (commented out the `[sources.cohere]` block) until a fetch strategy lands. Options when we want to revisit, ordered by sanity:
+
+- **Skip permanently.** Cohere isn't critical signal for an AI-pipeline wiki. Document and forget.
+- **Use Playwright** (browser-driven fetch) as a fallback fetcher in `news.py` for explicitly-marked Cloudflare-protected sources. Reliable; ~100 MB dependency; only worth it if multiple sources are similarly affected.
+- **Cloudscraper / undetected-chromedriver.** Cat-and-mouse with Cloudflare's detection — works for a few months, then breaks. Not recommended unless we already have one of these in the stack for another reason.
+- **Tune request headers** to mimic a real browser more aggressively (full `Sec-Fetch-*` set). Cheap to try; often enough for less-aggressive Cloudflare configs, useless against the JS challenge tier.
+
 ## Pending build work
 
 ### 1. HF Daily Papers (highest leverage)

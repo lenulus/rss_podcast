@@ -51,10 +51,14 @@ type = "sitemap"
 sitemap_url = "https://x.ai/sitemap.xml"
 path_filter = "/news/"
 
-[sources.cohere]
-type = "sitemap"
-sitemap_url = "https://cohere.com/sitemap.xml"
-path_filter = "/blog/"
+# Cohere is behind Cloudflare bot protection. Sitemap discovery works, but
+# per-article fetches get challenged and trafilatura only retrieves a stub
+# (title + reading-time, no body). Disabled until a fetch strategy lands —
+# see docs/news-roadmap.md "Known limitations".
+# [sources.cohere]
+# type = "sitemap"
+# sitemap_url = "https://cohere.com/sitemap.xml"
+# path_filter = "/blog/"
 
 # AI21's top-level sitemap is an index; we want the post sub-sitemap directly.
 [sources.ai21]
