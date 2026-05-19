@@ -20,6 +20,10 @@ fetch_delay_seconds = 1.5
 # ("2026-01-01") or relative age ("1y", "6m", "2w", "14d"). Per-source
 # `since` overrides this default.
 # since = "1y"
+# Number of consecutive fetch/extract failures before a URL is moved to
+# .failed (and skipped on future runs). Default 3. Useful for unpublished
+# drafts in RSS, stale sitemap entries, etc. Clear with --retry-failed.
+# max_failures = 3
 
 # ── Sources with native RSS ──────────────────────────────────────────────────
 

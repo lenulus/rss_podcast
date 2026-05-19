@@ -100,7 +100,7 @@ def _parse_iso_datetime(s: str) -> Optional[datetime]:
     return dt
 
 
-# ── State helpers (.processed) ────────────────────────────────────────────────
+# ── State helpers (.processed / .failed / .attempts.json) ───────────────────
 
 def processed_path(source: str) -> Path:
     return Path(f"./news/{source}/.processed")
@@ -118,6 +118,64 @@ def record_processed(source: str, url: str) -> None:
     p.parent.mkdir(parents=True, exist_ok=True)
     with open(p, "a", encoding="utf-8") as f:
         f.write(url + "\n")
+
+
+def failed_path(source: str) -> Path:
+    return Path(f"./news/{source}/.failed")
+
+
+def load_failed(source: str) -> set[str]:
+    """Permanently-failed URLs — skipped on discovery until --retry-failed clears them."""
+    p = failed_path(source)
+    if not p.exists():
+        return set()
+    return {line.strip() for line in p.read_text(encoding="utf-8").splitlines() if line.strip()}
+
+
+def record_failed(source: str, url: str) -> None:
+    p = failed_path(source)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    with open(p, "a", encoding="utf-8") as f:
+        f.write(url + "\n")
+
+
+def attempts_path(source: str) -> Path:
+    return Path(f"./news/{source}/.attempts.json")
+
+
+def load_attempts(source: str) -> dict:
+    """Per-URL transient failure counter. Reset on success; promoted to .failed
+    when count >= max_failures."""
+    p = attempts_path(source)
+    if not p.exists():
+        return {}
+    try:
+        import json
+        return json.loads(p.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def save_attempts(source: str, attempts: dict) -> None:
+    import json
+    p = attempts_path(source)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    # Drop URLs that are no longer failing (counter cleared)
+    pruned = {k: v for k, v in attempts.items() if v > 0}
+    p.write_text(json.dumps(pruned, indent=2), encoding="utf-8")
+
+
+def reset_failed(source: str) -> int:
+    """Clear .failed + .attempts.json for a source. Returns # entries cleared."""
+    n = 0
+    fp = failed_path(source)
+    if fp.exists():
+        n = sum(1 for _ in fp.read_text(encoding="utf-8").splitlines() if _.strip())
+        fp.unlink()
+    ap = attempts_path(source)
+    if ap.exists():
+        ap.unlink()
+    return n
 
 
 # ── Discovery ─────────────────────────────────────────────────────────────────
@@ -432,34 +490,34 @@ def discover_hf_papers(source_cfg: dict) -> list[tuple]:
 def fetch_and_extract(url: str, sid: Optional[str] = None) -> Optional[tuple[str, dict]]:
     """Return (markdown_body, metadata_dict) or None on failure.
 
-    When `sid` is provided, fetches via `requests` with the Substack
-    session cookie attached (`connect.sid=<sid>`, the express-session
-    cookie name that custom-domain Substack publications use). Unlocks
-    paywalled content for publications the cookie's owner has access to.
-    Without sid, falls back to trafilatura's default fetcher.
+    Always uses `requests.get` (not trafilatura's bundled fetcher) because:
+      - requests transparently follows 30x redirects (trafilatura's urllib
+        fetcher silently returns empty on some redirect chains — e.g. DeepMind's
+        deepmind.google → blog.google redirects)
+      - Surfaces explicit HTTP status codes for failure diagnosis instead of
+        an opaque "empty body"
+      - Trivially supports `connect.sid` cookie auth for Substack paywall bypass
 
-    Note: Substack uses `connect.sid` per publication custom domain
-    (e.g. www.latent.space). The substack.com top-level cookie is named
-    differently (substack.sid + substack.lli combo) and does NOT travel
-    cross-origin to the custom domain. Always copy the cookie from the
-    publication's own domain in dev tools, not from substack.com.
+    Note on Substack auth: `connect.sid` is the express-session cookie set by
+    each publication's custom domain (e.g. www.latent.space). The substack.com
+    top-level cookies are different (substack.sid + substack.lli combo) and do
+    NOT travel cross-origin. Always copy the cookie from the publication's own
+    domain in dev tools, not from substack.com.
     """
+    headers = {"User-Agent": DEFAULT_USER_AGENT}
+    cookies = {"connect.sid": sid} if sid else None
     try:
-        if sid:
-            r = requests.get(
-                url,
-                headers={"User-Agent": DEFAULT_USER_AGENT},
-                cookies={"connect.sid": sid},
-                timeout=HTTP_TIMEOUT,
-                allow_redirects=True,
-            )
-            r.raise_for_status()
-            downloaded = r.text
-        else:
-            downloaded = trafilatura.fetch_url(url)
+        r = requests.get(
+            url, headers=headers, cookies=cookies,
+            timeout=HTTP_TIMEOUT, allow_redirects=True,
+        )
     except Exception as e:
         print(f"    ✗ fetch failed: {e}")
         return None
+    if not r.ok:
+        print(f"    ✗ HTTP {r.status_code} from {r.url}")
+        return None
+    downloaded = r.text
     if not downloaded:
         print(f"    ✗ fetch returned empty")
         return None
@@ -691,10 +749,17 @@ def backup_source(source: str, defaults: dict, source_cfg: dict) -> None:
 # ── Source processing ────────────────────────────────────────────────────────
 
 def process_source(source: str, source_cfg: dict, defaults: dict,
-                   limit: Optional[int], check_only: bool) -> None:
+                   limit: Optional[int], check_only: bool,
+                   retry_failed: bool = False) -> None:
     delay = float(source_cfg.get("fetch_delay_seconds",
                                  defaults.get("fetch_delay_seconds", DEFAULT_FETCH_DELAY)))
+    max_failures = int(source_cfg.get("max_failures",
+                                      defaults.get("max_failures", 3)))
     print(f"\n[{source}] type={source_cfg.get('type','?')}")
+    if retry_failed:
+        n = reset_failed(source)
+        if n:
+            print(f"  cleared {n} entries from .failed (retry-failed mode)")
     try:
         discovered = discover(source_cfg)
     except Exception as e:
@@ -702,8 +767,12 @@ def process_source(source: str, source_cfg: dict, defaults: dict,
         return
     print(f"  discovered: {len(discovered)} URL(s)")
     seen = load_processed(source)
-    pending = [t for t in discovered if t[0] not in seen]
-    print(f"  pending (not in .processed): {len(pending)}")
+    failed = load_failed(source)
+    pending = [t for t in discovered if t[0] not in seen and t[0] not in failed]
+    if failed:
+        print(f"  pending (not in .processed): {len(pending)}  (skipping {len(failed)} in .failed)")
+    else:
+        print(f"  pending (not in .processed): {len(pending)}")
     if not pending:
         # Still run the backup pass — picks up locally-newer files that
         # weren't yet mirrored (e.g. first run after backup_path was set,
@@ -726,7 +795,9 @@ def process_source(source: str, source_cfg: dict, defaults: dict,
             print(f"    … and {len(pending) - 20} more")
         return
 
+    attempts = load_attempts(source)
     written = 0
+    promoted_to_failed = 0
     for i, (url, discovery_date, title_hint, payload) in enumerate(pending, 1):
         print(f"\n  [{i}/{len(pending)}] {url}")
         if payload is not None:
@@ -737,8 +808,20 @@ def process_source(source: str, source_cfg: dict, defaults: dict,
         else:
             extracted = fetch_and_extract(url, sid=source_cfg.get("sid"))
             if not extracted:
+                # Bump the per-URL failure counter; promote to .failed at threshold.
+                attempts[url] = attempts.get(url, 0) + 1
+                if attempts[url] >= max_failures:
+                    record_failed(source, url)
+                    attempts.pop(url, None)
+                    promoted_to_failed += 1
+                    print(f"    ✗ giving up after {max_failures} attempts — moved to .failed")
+                else:
+                    remaining = max_failures - attempts[url]
+                    print(f"    ↻ attempt {attempts[url]}/{max_failures} — will retry on future runs ({remaining} left)")
                 time.sleep(delay)
                 continue
+            # Success → clear any prior attempt counter for this URL.
+            attempts.pop(url, None)
             body, meta = extracted
             if not meta.get("title") and title_hint:
                 meta["title"] = title_hint
@@ -750,7 +833,9 @@ def process_source(source: str, source_cfg: dict, defaults: dict,
         written += 1
         print(f"    ✓ wrote {out_path.name} (published={published or '?'}, {body_len} chars)")
         time.sleep(delay)
-    print(f"\n  [{source}] wrote {written} new article(s).")
+    save_attempts(source, attempts)
+    suffix = f", {promoted_to_failed} moved to .failed" if promoted_to_failed else ""
+    print(f"\n  [{source}] wrote {written} new article(s){suffix}.")
     backup_source(source, defaults, source_cfg)
 
 
@@ -781,6 +866,9 @@ def main():
     parser.add_argument("--check", action="store_true", help="List new URLs without fetching")
     parser.add_argument("--limit", type=int, default=None, help="Max articles per source this run")
     parser.add_argument("--status", action="store_true", help="Per-source counts + last-fetched timestamp")
+    parser.add_argument("--retry-failed", action="store_true",
+                        help="Clear each targeted source's .failed list (and .attempts.json) before discovery, "
+                             "so URLs previously given up on get one more shot.")
     args = parser.parse_args()
 
     config = load_config(Path(args.config))
@@ -805,7 +893,8 @@ def main():
     defaults = config.get("defaults", {}) or {}
     for slug, cfg in targets.items():
         try:
-            process_source(slug, cfg, defaults, args.limit, args.check)
+            process_source(slug, cfg, defaults, args.limit, args.check,
+                           retry_failed=args.retry_failed)
         except Exception as e:
             print(f"\n  ✗ [{slug}] crashed: {e}")
 
