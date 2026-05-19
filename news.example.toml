@@ -15,6 +15,11 @@ fetch_delay_seconds = 1.5
 # Same backup_path the podcast pipeline uses is fine — news lands under
 # <backup_path>/news/<slug>/text/ so it never collides with podcast feeds.
 # backup_path = "/Volumes/PodcastSD/archive"
+# Skip articles older than this. Forward-only — doesn't touch already-ingested
+# local files, only filters discovery on future runs. Accepts ISO date
+# ("2026-01-01") or relative age ("1y", "6m", "2w", "14d"). Per-source
+# `since` overrides this default.
+# since = "1y"
 
 # ── Sources with native RSS ──────────────────────────────────────────────────
 
@@ -58,7 +63,8 @@ url = "https://www.latent.space/feed?sectionId=327741"
 # base_url = "https://www.latent.space"
 # section_id = 327741
 # sid = "s%3A..."         # connect.sid cookie; required for paid-tier posts
-# min_date = "2026-01-01" # optional ISO date floor; archive walks newest-first
+# since = "2026-01-01"    # optional date / age floor; archive walks newest-first
+                          # (legacy field: `min_date` still honored)
 
 [sources.google-keyword]
 type = "rss"

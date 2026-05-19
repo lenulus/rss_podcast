@@ -89,6 +89,64 @@ def effective_limit(args) -> int | None:
     return args._feed_cfg.get("max_downloads_per_run")
 
 
+def parse_since(spec):
+    """Parse a TOML `since` value into an aware UTC datetime, or return None.
+
+    Accepts:
+      '2026-01-01'              — absolute date (UTC midnight)
+      '2026-01-01T12:00:00Z'    — absolute datetime
+      '1y' / '6m' / '2w' / '14d' — relative age (subtracted from now)
+
+    Raises ValueError on unparseable strings. None or empty returns None.
+    """
+    from datetime import datetime, timedelta, timezone
+    if spec is None or (isinstance(spec, str) and not spec.strip()):
+        return None
+    s = str(spec).strip()
+    m = re.fullmatch(r"(\d+)([ymwd])", s)
+    if m:
+        n = int(m.group(1))
+        days_per = {"y": 365, "m": 30, "w": 7, "d": 1}[m.group(2)]
+        return datetime.now(timezone.utc) - timedelta(days=n * days_per)
+    try:
+        dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+    except ValueError:
+        raise ValueError(
+            f"Invalid 'since' value: {spec!r} "
+            "(expected 'YYYY-MM-DD' or 'Ny/Nm/Nw/Nd')"
+        )
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt
+
+
+def filter_entries_by_since(entries, feed_cfg: dict):
+    """If feed_cfg has a `since` field, drop entries whose pub date is older.
+
+    No-op when `since` is unset. Returns a filtered list; preserves input order.
+    """
+    cutoff = parse_since(feed_cfg.get("since"))
+    if cutoff is None:
+        return entries
+    kept = []
+    skipped = 0
+    for e in entries:
+        try:
+            pub = parsedate_to_datetime(e.published)
+        except Exception:
+            kept.append(e)
+            continue
+        if pub.tzinfo is None:
+            pub = pub.replace(tzinfo=timezone.utc)
+        if pub < cutoff:
+            skipped += 1
+            continue
+        kept.append(e)
+    if skipped:
+        print(f"  ↷ {skipped} entr{'y' if skipped == 1 else 'ies'} skipped (older than since={feed_cfg.get('since')!r})")
+    return kept
+
+
 def sort_entries_by_order(entries, feed_cfg: dict):
     """Sort feed entries by download_order ('newest' default, or 'oldest')."""
     order = (feed_cfg.get("download_order") or "newest").lower()
@@ -1281,7 +1339,8 @@ def run_download(feed, args):
     print(f"Output dir: {out_dir} ({len(existing_mp3s)} existing mp3(s), {len(existing_transcripts)} already transcribed)\n")
 
     limit = effective_limit(args)
-    entries = sort_entries_by_order(feed.entries, args._feed_cfg)
+    entries = filter_entries_by_since(feed.entries, args._feed_cfg)
+    entries = sort_entries_by_order(entries, args._feed_cfg)
     fetched = 0
 
     for entry in entries:
@@ -1334,7 +1393,8 @@ def run_fetch(feed, args):
     print(f"Output dir: {out_dir} ({len(existing)} existing transcript(s))\n")
 
     limit = effective_limit(args)
-    entries = sort_entries_by_order(feed.entries, args._feed_cfg)
+    entries = filter_entries_by_since(feed.entries, args._feed_cfg)
+    entries = sort_entries_by_order(entries, args._feed_cfg)
     fetched = 0
 
     for entry in entries:

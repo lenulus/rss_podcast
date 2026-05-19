@@ -20,7 +20,7 @@ import re
 import shutil
 import sys
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -53,6 +53,53 @@ def resolve_defaults(config: dict, source_cfg: dict) -> dict:
     return {**defaults, **(source_cfg or {})}
 
 
+def parse_since(spec) -> Optional[datetime]:
+    """Parse a TOML `since` value into an aware UTC datetime, or None.
+
+    Accepts:
+      '2026-01-01'              — absolute date (UTC midnight)
+      '2026-01-01T12:00:00Z'    — absolute datetime
+      '1y' / '6m' / '2w' / '14d' — relative age (subtracted from now)
+
+    Raises ValueError on unparseable strings. None / empty returns None.
+    """
+    if spec is None or (isinstance(spec, str) and not spec.strip()):
+        return None
+    s = str(spec).strip()
+    m = re.fullmatch(r"(\d+)([ymwd])", s)
+    if m:
+        n = int(m.group(1))
+        days_per = {"y": 365, "m": 30, "w": 7, "d": 1}[m.group(2)]
+        return datetime.now(timezone.utc) - timedelta(days=n * days_per)
+    try:
+        dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+    except ValueError:
+        raise ValueError(
+            f"Invalid 'since' value: {spec!r} "
+            "(expected 'YYYY-MM-DD' or 'Ny/Nm/Nw/Nd')"
+        )
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt
+
+
+def _parse_iso_datetime(s: str) -> Optional[datetime]:
+    """Best-effort ISO-8601 parse returning aware UTC datetime, or None."""
+    if not s:
+        return None
+    try:
+        dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+    except ValueError:
+        try:
+            from email.utils import parsedate_to_datetime
+            dt = parsedate_to_datetime(s)
+        except Exception:
+            return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt
+
+
 # ── State helpers (.processed) ────────────────────────────────────────────────
 
 def processed_path(source: str) -> Path:
@@ -81,7 +128,9 @@ def discover_rss(source_cfg: dict) -> list[tuple[str, str, str]]:
     feed = feedparser.parse(url)
     if feed.bozo and not feed.entries:
         raise RuntimeError(f"RSS parse failed: {feed.bozo_exception}")
+    cutoff = parse_since(source_cfg.get("since"))
     out: list[tuple[str, str, str]] = []
+    skipped = 0
     for e in feed.entries:
         link = e.get("link", "").strip()
         if not link:
@@ -92,7 +141,14 @@ def discover_rss(source_cfg: dict) -> list[tuple[str, str, str]]:
             if t:
                 published_iso = datetime(*t[:6], tzinfo=timezone.utc).isoformat()
                 break
+        if cutoff and published_iso:
+            pub_dt = _parse_iso_datetime(published_iso)
+            if pub_dt and pub_dt < cutoff:
+                skipped += 1
+                continue
         out.append((link, published_iso, e.get("title", "").strip()))
+    if skipped:
+        print(f"    ↷ {skipped} entries skipped (older than since={source_cfg.get('since')!r})")
     return out
 
 
@@ -106,6 +162,7 @@ def discover_sitemap(source_cfg: dict) -> list[tuple[str, str, str]]:
     url = source_cfg["sitemap_url"]
     path_filter = source_cfg.get("path_filter", "")
     sub_filter = source_cfg.get("sub_sitemap_filter", "")
+    cutoff = parse_since(source_cfg.get("since"))
     headers = {"User-Agent": DEFAULT_USER_AGENT}
     r = requests.get(url, headers=headers, timeout=HTTP_TIMEOUT)
     r.raise_for_status()
@@ -120,16 +177,19 @@ def discover_sitemap(source_cfg: dict) -> list[tuple[str, str, str]]:
             try:
                 sr = requests.get(sub, headers=headers, timeout=HTTP_TIMEOUT)
                 sr.raise_for_status()
-                out.extend(_parse_urlset(sr.text, path_filter))
+                out.extend(_parse_urlset(sr.text, path_filter, cutoff))
             except Exception as e:
                 print(f"    ⚠ sub-sitemap fetch failed for {sub}: {e}")
             time.sleep(0.3)
+        if cutoff:
+            _report_since_skip(source_cfg, sum(1 for u, _, _ in out if not u))  # no-op; reported inside
         return out
-    return _parse_urlset(body, path_filter)
+    return _parse_urlset(body, path_filter, cutoff, since_label=source_cfg.get("since"))
 
 
-def _parse_urlset(body: str, path_filter: str) -> list[tuple[str, str, str]]:
+def _parse_urlset(body: str, path_filter: str, cutoff=None, since_label=None) -> list[tuple[str, str, str]]:
     out: list[tuple[str, str, str]] = []
+    skipped = 0
     for block in re.findall(r"<url[^>]*>(.*?)</url>", body, re.DOTALL | re.IGNORECASE):
         loc = re.search(r"<loc[^>]*>([^<]+)</loc>", block, re.IGNORECASE)
         if not loc:
@@ -140,9 +200,22 @@ def _parse_urlset(body: str, path_filter: str) -> list[tuple[str, str, str]]:
         # Skip the index pages themselves (e.g. /news, /blog with no trailing path)
         if u.rstrip("/").endswith(path_filter.rstrip("/")):
             continue
-        lastmod = re.search(r"<lastmod[^>]*>([^<]+)</lastmod>", block, re.IGNORECASE)
-        out.append((u, lastmod.group(1).strip() if lastmod else "", ""))
+        lastmod_m = re.search(r"<lastmod[^>]*>([^<]+)</lastmod>", block, re.IGNORECASE)
+        lastmod = lastmod_m.group(1).strip() if lastmod_m else ""
+        if cutoff and lastmod:
+            lm_dt = _parse_iso_datetime(lastmod)
+            if lm_dt and lm_dt < cutoff:
+                skipped += 1
+                continue
+        out.append((u, lastmod, ""))
+    if skipped and since_label is not None:
+        print(f"    ↷ {skipped} URLs skipped (older than since={since_label!r})")
     return out
+
+
+def _report_since_skip(*args, **kwargs):
+    """Placeholder for future per-source skip-reporting helper. Currently noop."""
+    pass
 
 
 def discover(source_cfg: dict) -> list[tuple]:
@@ -186,7 +259,8 @@ def discover_substack_archive(source_cfg: dict) -> list[tuple]:
     base_url = source_cfg["base_url"].rstrip("/")
     section_id = source_cfg["section_id"]
     sid = source_cfg.get("sid")
-    min_date = (source_cfg.get("min_date") or "").strip()
+    # Honor `since` (preferred) or legacy `min_date` field for backward compat.
+    cutoff = parse_since(source_cfg.get("since") or source_cfg.get("min_date"))
 
     headers = {"User-Agent": DEFAULT_USER_AGENT, "Accept": "application/json"}
     cookies = {"connect.sid": sid} if sid else {}
@@ -206,10 +280,12 @@ def discover_substack_archive(source_cfg: dict) -> list[tuple]:
             slug = (post.get("slug") or "").strip()
             canonical = (post.get("canonical_url") or "").strip() or f"{base_url}/p/{slug}"
             post_date = (post.get("post_date") or "")[:25]
-            if min_date and post_date and post_date[:10] < min_date:
-                # Posts come newest-first; once we drop below min_date,
-                # the rest of the archive is older still — stop paginating.
-                return out
+            if cutoff and post_date:
+                post_dt = _parse_iso_datetime(post_date)
+                if post_dt and post_dt < cutoff:
+                    # Posts come newest-first; once below cutoff, the rest is
+                    # older still — stop paginating.
+                    return out
             title = (post.get("title") or "").strip()
             out.append((canonical, post_date, title, None))
         if len(data) < page_size:
@@ -318,6 +394,20 @@ def discover_hf_papers(source_cfg: dict) -> list[tuple]:
         before = len(normalized)
         normalized = [p for p in normalized if p["upvotes"] >= min_upvotes]
         print(f"    filtered by min_upvotes={min_upvotes}: {before} → {len(normalized)}")
+
+    cutoff = parse_since(source_cfg.get("since"))
+    if cutoff is not None:
+        before = len(normalized)
+        filtered = []
+        for p in normalized:
+            ref = p.get("submitted_on_daily_at") or p.get("published_at") or ""
+            ref_dt = _parse_iso_datetime(ref)
+            if ref_dt and ref_dt < cutoff:
+                continue
+            filtered.append(p)
+        normalized = filtered
+        if before != len(normalized):
+            print(f"    filtered by since={source_cfg.get('since')!r}: {before} → {len(normalized)}")
 
     # Stable sort: secondary key first (submittedOnDailyAt DESC), then primary (upvotes DESC).
     normalized.sort(key=lambda p: p["submitted_on_daily_at"] or "", reverse=True)

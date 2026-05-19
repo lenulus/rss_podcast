@@ -50,6 +50,14 @@ rss = "https://api.substack.com/feed/podcast/XXXXXX/private-key.rss"
 # Use "oldest" for incremental backfill of an archive.
 # download_order = "newest"   # or "oldest"
 
+# Skip episodes older than this when downloading. Forward-only — does not
+# touch already-ingested local files; only filters what gets fetched on
+# subsequent --download / --daily runs. Accepts:
+#   - ISO date:     "2026-01-01" or "2026-01-01T00:00:00Z"
+#   - Relative age: "1y", "6m", "2w", "14d" (resolved against `now` each run)
+# Unset = no cutoff (current default — pulls anything not already on disk).
+# since = "1y"
+
 # Enable speaker diarization for this feed. Adds a pyannote pass over each
 # mp3 during --transcribe and emits "**Speaker A** (mm:ss):" headers per
 # turn in the .md output. Requires pyannote.audio installed and a HuggingFace

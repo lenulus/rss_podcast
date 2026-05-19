@@ -101,6 +101,9 @@ host = "Lex Fridman"                  # optional, overrides RSS-derived host
 daily = true                          # optional, default true; set false to skip in --daily
 download_order = "newest"             # optional, "newest" (default) or "oldest"
 max_downloads_per_run = 5             # optional, no default (unbounded)
+since = "1y"                          # optional, forward-only download cutoff;
+                                      # accepts ISO date ("2026-01-01") or
+                                      # relative age ("1y", "6m", "2w", "14d")
 max_episodes_on_disk = 10             # optional, no eviction if unset
 backup_path = "..."                   # optional, overrides [defaults]
 media_dir = "..."                     # optional, fully overrides media backup path
