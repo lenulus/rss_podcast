@@ -32,6 +32,15 @@ subprocess_per_episode = true
 
 **Smaller machines (e.g. M1 Pro 32 GB):** drop `whisper_batch_size` to 12–16 (large Whisper bursts won't fit), and `--subprocess-concurrency` to 4–6 (proportional to memory headroom). Same code, different knob values.
 
+**Long backlogs (50+ episodes):** wrap the invocation in `./loop.sh` instead of calling `./run.sh` directly. It repeatedly invokes `./run.sh --transcribe --limit N` (default N=60), respawning the Python parent each batch. This is the fix for the slow per-worker drift we see beyond ~60 episodes — `subprocess_per_episode` prevents the in-process leak, but state below Python (Metal driver client caches, kernel resources bound to the parent's task tree) only releases on parent exit. Examples:
+
+```bash
+./loop.sh --feed lex-fridman --diarize-only --subprocess-concurrency 6
+./loop.sh --feed dwarkesh --batch 40
+```
+
+All other args (`--diarize-only`, `--subprocess-concurrency`, `--model`, etc.) pass through verbatim. Loop exits when pending hits zero, or aborts with non-zero if a full batch makes no progress (catches real failure — OOM, model load broken, etc.).
+
 ## State map (where everything lives)
 
 | Path | Owner | What |
@@ -62,6 +71,7 @@ subprocess_per_episode = true
 | Transcribe everything pending | `./run.sh --transcribe` | none | hours |
 | Transcribe one feed | `./run.sh --feed <tag> --transcribe` | none | hours |
 | Pre-diarize a feed at high concurrency, then transcribe later | `./run.sh --feed <tag> --diarize-only --subprocess-concurrency 6` then `./run.sh --feed <tag> --transcribe` | none | hours |
+| Long-backlog run with periodic parent restart (drift-resistant) | `./loop.sh --feed <tag> [--diarize-only] [--subprocess-concurrency N] [--batch 60]` | none | hours |
 | Add metadata + chapter headings to old transcripts | `./run.sh --backfill-headers` | RSS only | seconds |
 | List episodes in a feed (tabular) | `./run.sh --feed <tag> --index [--limit N]` | RSS only | seconds |
 | Force diarization on/off for one run | `... --diarize` or `... --no-diarize` | — | — |
