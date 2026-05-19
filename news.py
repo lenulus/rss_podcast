@@ -705,6 +705,10 @@ def process_source(source: str, source_cfg: dict, defaults: dict,
     pending = [t for t in discovered if t[0] not in seen]
     print(f"  pending (not in .processed): {len(pending)}")
     if not pending:
+        # Still run the backup pass — picks up locally-newer files that
+        # weren't yet mirrored (e.g. first run after backup_path was set,
+        # or after the SD card was unmounted on a prior pass).
+        backup_source(source, defaults, source_cfg)
         return
     # For RSS/sitemap, sort newest first by lastmod/published date. For HF papers,
     # discover_hf_papers already sorted by (upvotes DESC, submittedOnDailyAt DESC),
