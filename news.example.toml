@@ -119,3 +119,27 @@ discovery_mode = "daily-api"      # "daily-api" (50 most-recent) or "weekly-html
 min_upvotes = 10                  # community-endorsement floor; filtered papers stay re-checkable
 top_n = 5                         # per-poll cap after sorting (upvotes DESC, then submittedOnDailyAt DESC)
 fetch_delay_seconds = 0.5         # HF API is fast; minimal politeness delay
+
+# ── Static-markdown SPAs (Angular/React sites serving raw .md files) ─────────
+# Some publishers ship a JS-only client app that fetches blog posts as static
+# markdown at runtime (no SSR, no API, no RSS). This source type bypasses the
+# need for a headless browser by:
+#   1. Fetching `base_url + bundle_path` (default "/", the homepage)
+#   2. Applying `bundle_regex` to find the main JS bundle URL
+#   3. Fetching the bundle and applying `slug_regex` to enumerate articles
+#   4. Fetching each `article_url_template` and parsing YAML frontmatter
+#
+# Trafilatura is skipped entirely — the publisher's own markdown is canonical.
+#
+# Example: antigravity.google. Bundle URL rotates on every deploy, so the
+# bundle_regex matches the hash-suffixed filename pattern, not a literal URL.
+[sources.antigravity]
+type = "static-markdown-spa"
+base_url = "https://antigravity.google"
+# Optional. Page on base_url whose HTML contains a <script src=…> reference
+# matched by bundle_regex. Defaults to "/" (the homepage), which is right
+# for most SPAs.
+# bundle_path = "/"
+bundle_regex = '<script[^>]+src="(main-[A-Z0-9]+\.js)"'
+slug_regex = 'link:"/blog/([a-z0-9-]+)"'
+article_url_template = "/assets/blog-posts/{slug}.md"

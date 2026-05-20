@@ -293,6 +293,8 @@ def discover(source_cfg: dict) -> list[tuple]:
         return discover_hf_papers(source_cfg)
     if t == "substack-section-archive":
         return discover_substack_archive(source_cfg)
+    if t == "static-markdown-spa":
+        return [(u, d, ti, None) for u, d, ti in discover_static_markdown_spa(source_cfg)]
     raise ValueError(f"Unknown source type: {t!r}")
 
 
@@ -351,6 +353,153 @@ def discover_substack_archive(source_cfg: dict) -> list[tuple]:
         offset += page_size
         time.sleep(0.3)
     return out
+
+
+# ── Static-markdown SPAs (Angular/React sites serving raw .md files) ─────────
+
+def discover_static_markdown_spa(source_cfg: dict) -> list[tuple[str, str, str]]:
+    """Discover articles from a JS-rendered SPA that fetches static .md files.
+
+    Some publishers (e.g. antigravity.google) ship pure client-side apps that
+    populate blog posts by fetch()ing raw markdown from a fixed path. The full
+    slug list is typically embedded in the main JS bundle as router metadata.
+    We exploit this by reading the bundle as text and extracting slugs with a
+    user-supplied regex — no headless browser required.
+
+    Required config:
+      base_url             — e.g. "https://antigravity.google" (no trailing slash)
+      bundle_regex         — regex with one capture group matching the bundle src
+                             inside the bundle_path HTML. The captured value is
+                             treated as a path relative to base_url.
+      slug_regex           — regex with one capture group matching slugs inside
+                             the bundle text (one match per article).
+      article_url_template — path template; {slug} is substituted per match.
+                             Example: "/assets/blog-posts/{slug}.md"
+
+    Optional:
+      bundle_path          — page to fetch first (default "/"). Must contain
+                             a <script src=…> reference the bundle_regex matches.
+
+    Returns [(article_url, "", ""), …]. Date and title are filled later from
+    the markdown's YAML frontmatter (fetch_markdown_passthrough).
+    """
+    base_url = source_cfg["base_url"].rstrip("/")
+    bundle_path = source_cfg.get("bundle_path", "/")
+    bundle_regex = source_cfg["bundle_regex"]
+    slug_regex = source_cfg["slug_regex"]
+    article_url_template = source_cfg["article_url_template"]
+
+    headers = {"User-Agent": DEFAULT_USER_AGENT}
+
+    home_url = base_url + (bundle_path if bundle_path.startswith("/") else "/" + bundle_path)
+    r = requests.get(home_url, headers=headers, timeout=HTTP_TIMEOUT, allow_redirects=True)
+    r.raise_for_status()
+
+    m = re.search(bundle_regex, r.text)
+    if not m:
+        raise ValueError(f"bundle_regex did not match in {home_url}")
+    bundle_ref = m.group(1)
+    if bundle_ref.startswith("http"):
+        bundle_url = bundle_ref
+    else:
+        bundle_url = base_url + (bundle_ref if bundle_ref.startswith("/") else "/" + bundle_ref)
+
+    rb = requests.get(bundle_url, headers=headers, timeout=HTTP_TIMEOUT, allow_redirects=True)
+    rb.raise_for_status()
+
+    slugs = sorted(set(re.findall(slug_regex, rb.text)))
+    if not slugs:
+        raise ValueError(f"slug_regex matched 0 slugs in {bundle_url}")
+
+    out: list[tuple[str, str, str]] = []
+    for slug in slugs:
+        path = article_url_template.format(slug=slug)
+        if not path.startswith("/"):
+            path = "/" + path
+        out.append((base_url + path, "", ""))
+    return out
+
+
+def _parse_simple_frontmatter(text: str) -> tuple[dict, str]:
+    """Tiny YAML-frontmatter parser for the subset our sources actually use.
+
+    Handles `key: value` lines (with optional quotes) and one level of list
+    nesting (`categories:` followed by `  - Foo` lines). Returns (meta, body).
+    If `text` doesn't start with a `---` fence, meta is {} and body is text.
+    """
+    if not text.startswith("---"):
+        return {}, text
+    lines = text.split("\n")
+    if lines[0].strip() != "---":
+        return {}, text
+    fm_end = None
+    for i, line in enumerate(lines[1:], 1):
+        if line.strip() == "---":
+            fm_end = i
+            break
+    if fm_end is None:
+        return {}, text
+    fm_lines = lines[1:fm_end]
+    body = "\n".join(lines[fm_end + 1:]).lstrip("\n")
+
+    meta: dict = {}
+    current_list_key: Optional[str] = None
+    for line in fm_lines:
+        stripped = line.strip()
+        if not stripped:
+            current_list_key = None
+            continue
+        if current_list_key and stripped.startswith("- "):
+            meta.setdefault(current_list_key, []).append(stripped[2:].strip())
+            continue
+        if ":" in line:
+            current_list_key = None
+            key, _, val = line.partition(":")
+            key = key.strip()
+            val = val.strip()
+            if (val.startswith('"') and val.endswith('"')) or \
+               (val.startswith("'") and val.endswith("'")):
+                val = val[1:-1]
+            if not val:
+                current_list_key = key
+                meta[key] = []
+                continue
+            meta[key] = val
+    return meta, body
+
+
+def fetch_markdown_passthrough(url: str) -> Optional[tuple[str, dict]]:
+    """Fetch a raw markdown URL and split frontmatter without HTML extraction.
+
+    Used by source types where the publisher already serves articles as static
+    markdown files (e.g. static-markdown-spa). Returns the same (body, meta)
+    shape as fetch_and_extract so downstream render_article works unchanged.
+    """
+    headers = {"User-Agent": DEFAULT_USER_AGENT}
+    try:
+        r = requests.get(url, headers=headers, timeout=HTTP_TIMEOUT, allow_redirects=True)
+    except Exception as e:
+        print(f"    ✗ fetch failed: {e}")
+        return None
+    if not r.ok:
+        print(f"    ✗ HTTP {r.status_code} from {r.url}")
+        return None
+    if not r.text:
+        print(f"    ✗ fetch returned empty")
+        return None
+    fm, body = _parse_simple_frontmatter(r.text)
+    if not body.strip():
+        print(f"    ✗ markdown body empty after frontmatter")
+        return None
+    def _s(v):
+        return v.strip() if isinstance(v, str) else ""
+    meta_dict = {
+        "title": _s(fm.get("title")),
+        "author": _s(fm.get("author")),
+        "date": _s(fm.get("date")),
+        "sitename": "",
+    }
+    return body, meta_dict
 
 
 # ── Hugging Face Daily Papers ────────────────────────────────────────────────
@@ -577,6 +726,9 @@ def slug_from_url(url: str) -> str:
     """Last path segment, lowercased, safe-chars-only, length-capped."""
     tail = url.rstrip("/").rsplit("/", 1)[-1] or "index"
     tail = tail.split("?", 1)[0].split("#", 1)[0]
+    # Strip a single trailing file extension (.md / .html / .htm / .json …).
+    # Otherwise sanitization turns "foo.md" into "foo-md" which is ugly.
+    tail = re.sub(r"\.[a-z0-9]{1,5}$", "", tail, flags=re.IGNORECASE)
     safe = re.sub(r"[^a-z0-9-]+", "-", tail.lower()).strip("-")
     if not safe:
         safe = hashlib.sha1(url.encode()).hexdigest()[:10]
@@ -806,7 +958,10 @@ def process_source(source: str, source_cfg: dict, defaults: dict,
             out_path, content, published = render_hf_paper(source, payload)
             body_len = len(payload.get("summary", "") or "") + len(payload.get("ai_summary", "") or "")
         else:
-            extracted = fetch_and_extract(url, sid=source_cfg.get("sid"))
+            if source_cfg.get("type") == "static-markdown-spa":
+                extracted = fetch_markdown_passthrough(url)
+            else:
+                extracted = fetch_and_extract(url, sid=source_cfg.get("sid"))
             if not extracted:
                 # Bump the per-URL failure counter; promote to .failed at threshold.
                 attempts[url] = attempts.get(url, 0) + 1
