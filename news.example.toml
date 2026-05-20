@@ -70,6 +70,27 @@ url = "https://www.latent.space/feed?sectionId=327741"
 # since = "2026-01-01"    # optional date / age floor; archive walks newest-first
                           # (legacy field: `min_date` still honored)
 
+# Simon Willison's blog — high-signal practitioner commentary, near-daily.
+# /atom/everything/ is the canonical site feed (link-blog + essays);
+# /atom/entries/ is essays-only if firehose is too noisy. feedparser
+# handles Atom transparently, so type stays "rss".
+[sources.simonwillison]
+type = "rss"
+url = "https://simonwillison.net/atom/everything/"
+
+# METR — agent autonomy evaluations and frontier-model reports. Two distinct
+# content streams under one sitemap: announcements/hiring at /blog/ and the
+# per-model technical reports at /evaluations/.
+[sources.metr-blog]
+type = "sitemap"
+sitemap_url = "https://metr.org/sitemap.xml"
+path_filter = "/blog/"
+
+[sources.metr-evaluations]
+type = "sitemap"
+sitemap_url = "https://metr.org/sitemap.xml"
+path_filter = "/evaluations/"
+
 [sources.google-keyword]
 type = "rss"
 # AI-specific subfeed (filters out the generic Keyword noise like Brandcast,
@@ -109,6 +130,23 @@ path_filter = "/news/"
 type = "sitemap"
 sitemap_url = "https://www.ai21.com/post-sitemap.xml"
 path_filter = "/blog/"
+
+# Cognition AI's sitemap emits scheme-less <loc> values (cognition.ai/blog/foo
+# instead of https://cognition.ai/blog/foo). _parse_urlset repairs those by
+# prepending the sitemap's host — no extra config needed.
+[sources.cognition]
+type = "sitemap"
+sitemap_url = "https://cognition.ai/sitemap.xml"
+path_filter = "/blog/"
+
+# Cursor's sitemap mixes blog posts with topic/category index pages like
+# /blog/topic/product. `path_exclude` is a substring filter — if any URL
+# contains it, the entry is skipped before per-article fetch.
+[sources.cursor]
+type = "sitemap"
+sitemap_url = "https://cursor.com/sitemap.xml"
+path_filter = "/blog/"
+path_exclude = "/blog/topic/"
 
 # ── Hugging Face Daily Papers ─────────────────────────────────────────────────
 # Curated AI/ML research papers via JSON API. Daily volume is ~10–20 new papers;

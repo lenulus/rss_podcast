@@ -193,6 +193,10 @@ def discover_rss(source_cfg: dict) -> list[tuple[str, str, str]]:
         link = e.get("link", "").strip()
         if not link:
             continue
+        # Strip URL fragments. Some Atom feeds (e.g. simonwillison.net) append
+        # an anchor like "#atom-everything" identifying the feed source —
+        # noise for dedup and for the rendered article URL.
+        link = link.split("#", 1)[0]
         published_iso = ""
         for key in ("published_parsed", "updated_parsed"):
             t = e.get(key)
@@ -219,6 +223,7 @@ def discover_sitemap(source_cfg: dict) -> list[tuple[str, str, str]]:
     """
     url = source_cfg["sitemap_url"]
     path_filter = source_cfg.get("path_filter", "")
+    path_exclude = source_cfg.get("path_exclude", "")
     sub_filter = source_cfg.get("sub_sitemap_filter", "")
     cutoff = parse_since(source_cfg.get("since"))
     headers = {"User-Agent": DEFAULT_USER_AGENT}
@@ -235,17 +240,30 @@ def discover_sitemap(source_cfg: dict) -> list[tuple[str, str, str]]:
             try:
                 sr = requests.get(sub, headers=headers, timeout=HTTP_TIMEOUT)
                 sr.raise_for_status()
-                out.extend(_parse_urlset(sr.text, path_filter, cutoff))
+                out.extend(_parse_urlset(sr.text, path_filter, cutoff,
+                                          sitemap_url=sub, path_exclude=path_exclude))
             except Exception as e:
                 print(f"    ⚠ sub-sitemap fetch failed for {sub}: {e}")
             time.sleep(0.3)
         if cutoff:
             _report_since_skip(source_cfg, sum(1 for u, _, _ in out if not u))  # no-op; reported inside
         return out
-    return _parse_urlset(body, path_filter, cutoff, since_label=source_cfg.get("since"))
+    return _parse_urlset(body, path_filter, cutoff,
+                          since_label=source_cfg.get("since"),
+                          sitemap_url=url, path_exclude=path_exclude)
 
 
-def _parse_urlset(body: str, path_filter: str, cutoff=None, since_label=None) -> list[tuple[str, str, str]]:
+def _parse_urlset(body: str, path_filter: str, cutoff=None, since_label=None,
+                  sitemap_url: str = "", path_exclude: str = "") -> list[tuple[str, str, str]]:
+    # Derive scheme + host from the sitemap URL so we can repair scheme-less
+    # <loc> entries like `cognition.ai/blog/foo` (which some CMSs emit despite
+    # the sitemap spec requiring absolute URLs).
+    host_prefix = ""
+    if sitemap_url:
+        m = re.match(r"^(https?://[^/]+)", sitemap_url)
+        if m:
+            host_prefix = m.group(1)
+
     out: list[tuple[str, str, str]] = []
     skipped = 0
     for block in re.findall(r"<url[^>]*>(.*?)</url>", body, re.DOTALL | re.IGNORECASE):
@@ -253,7 +271,18 @@ def _parse_urlset(body: str, path_filter: str, cutoff=None, since_label=None) ->
         if not loc:
             continue
         u = loc.group(1).strip()
+        # Repair scheme-less URLs. Two shapes occur in the wild:
+        #   (a) "cognition.ai/blog/foo"  — host present, scheme missing → add scheme only
+        #   (b) "/blog/foo"              — path-only → prepend the sitemap's host_prefix
+        if not re.match(r"^https?://", u) and host_prefix:
+            bare_host = host_prefix.split("://", 1)[1]
+            if u.startswith(bare_host + "/") or u == bare_host:
+                u = "https://" + u
+            else:
+                u = host_prefix + ("" if u.startswith("/") else "/") + u
         if path_filter and path_filter not in u:
+            continue
+        if path_exclude and path_exclude in u:
             continue
         # Skip the index pages themselves (e.g. /news, /blog with no trailing path)
         if u.rstrip("/").endswith(path_filter.rstrip("/")):
