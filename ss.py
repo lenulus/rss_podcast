@@ -20,6 +20,7 @@ import re
 import shutil
 import sys
 import time
+import unicodedata
 from datetime import timezone
 from email.utils import parsedate_to_datetime
 from pathlib import Path
@@ -1245,13 +1246,17 @@ def prune_feed_mp3s(tag: str, feed_cfg: dict) -> None:
     if len(mp3s_old_to_new) <= cap:
         return
 
-    transcripts = {p.stem for p in transcript_dir.glob("*.md")} if transcript_dir.is_dir() else set()
+    # NFC-normalize both sides: macOS sometimes returns .md filenames in NFD
+    # (decomposed) form while RSS-derived mp3 stems are NFC, causing byte-level
+    # set-membership to miss for titles with é / ç / ü / ï / etc.
+    transcripts = {unicodedata.normalize("NFC", p.stem) for p in transcript_dir.glob("*.md")} \
+        if transcript_dir.is_dir() else set()
 
     # Keep the newest N — evict from what's left.
     to_keep = set(mp3s_old_to_new[-cap:])
     candidates = [p for p in mp3s_old_to_new if p not in to_keep]
-    evictable = [p for p in candidates if p.stem in transcripts]
-    blocked = [p for p in candidates if p.stem not in transcripts]
+    evictable = [p for p in candidates if unicodedata.normalize("NFC", p.stem) in transcripts]
+    blocked = [p for p in candidates if unicodedata.normalize("NFC", p.stem) not in transcripts]
 
     if blocked:
         print(f"  ⚠ [{tag}] {len(blocked)} old mp3(s) have no transcript — keeping for safety:")
