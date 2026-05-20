@@ -99,6 +99,14 @@ type = "rss"
 # rollouts which complement DeepMind (research) and Google Research (academic).
 url = "https://blog.google/technology/ai/rss/"
 
+# NVIDIA — WordPress blog with category subfeeds. The main /feed/ mixes AI
+# news with gaming/GeForce posts; the generative-ai subfeed stays on-topic
+# (agents, Nemotron, RTX AI, partner integrations). deep-learning is the
+# research-leaning alternative if you want fewer product announcements.
+[sources.nvidia-ai]
+type = "rss"
+url = "https://blogs.nvidia.com/blog/category/generative-ai/feed/"
+
 # ── Sources with no RSS — discovery via sitemap.xml ──────────────────────────
 
 [sources.anthropic]
