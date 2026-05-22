@@ -1943,6 +1943,7 @@ def _run_feed_via_subprocess(args, mp3_dir: Path, out_dir: Path,
             "--transcribe",
             "--no-subprocess-per-episode",
             "--only", mp3.stem,
+            "--no-final-summary",
         ]
         if diarize_only:
             cmd.append("--diarize-only")
@@ -2230,7 +2231,12 @@ def run_transcribe(args):
         post_process(mp3_dir)
 
     done_verb = "diarized" if diarize_only else "transcribed"
-    print(f"\nDone. {total_done} file(s) {done_verb}.")
+    # When invoked by a subprocess-per-episode parent, suppress the per-child
+    # final summary — the parent emits the authoritative grand total. Without
+    # this guard, each child prints "Done. 1 file(s) ..." AND the parent
+    # prints "Done. N file(s) ...", which is noisy and misleads tallies.
+    if not getattr(args, "_suppress_summary", False):
+        print(f"\nDone. {total_done} file(s) {done_verb}.")
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
@@ -2296,7 +2302,12 @@ def main():
                              "opted out with `daily = false` in feeds.toml. Per-feed errors "
                              "don't block the rest of the routine. With --feed <tag>, "
                              "scopes the routine to that one feed.")
+    parser.add_argument("--no-final-summary", action="store_true",
+                        help="Suppress the closing 'Done. N file(s) transcribed.' line. "
+                             "Used by subprocess-per-episode parents so each child doesn't "
+                             "emit its own summary alongside the parent's grand total.")
     args = parser.parse_args()
+    args._suppress_summary = args.no_final_summary
 
     # Wrap stdout for concurrent subprocesses so each line carries its worker
     # label (set by the parent via --label). Skipped when --label is empty.
