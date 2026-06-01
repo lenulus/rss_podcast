@@ -18,7 +18,9 @@ import argparse
 import hashlib
 import re
 import shutil
+import subprocess
 import sys
+import tempfile
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -32,6 +34,46 @@ import trafilatura
 DEFAULT_FETCH_DELAY = 1.5
 DEFAULT_USER_AGENT = "Mozilla/5.0 (Macintosh; ss-news/1.0) Gecko/Firefox"
 HTTP_TIMEOUT = 20
+
+
+def _curl_get(url: str, headers: Optional[dict] = None,
+              cookies: Optional[dict] = None,
+              timeout: int = HTTP_TIMEOUT) -> tuple[int, str, str]:
+    """Fetch `url` with the system curl binary. Returns (status, text, final_url).
+
+    Some sites sit behind TLS-fingerprinting bot challenges (e.g. Vercel's
+    "Security Checkpoint", X-Vercel-Mitigated: challenge) that 403 Python's
+    urllib3/requests — and trafilatura's bundled fetcher — but pass curl's
+    TLS handshake regardless of User-Agent. Sources mark `fetcher = "curl"`
+    to route through here instead of requests. status is 0 if curl itself
+    errored (network failure / timeout). curl follows redirects (-L) and
+    transparently decompresses (--compressed), matching the requests path's
+    behavior; cookies support the same connect.sid auth the requests path uses.
+    """
+    hdrs = dict(headers or {})
+    ua = DEFAULT_USER_AGENT
+    for k in list(hdrs):
+        if k.lower() == "user-agent":
+            ua = hdrs.pop(k)
+    cmd = ["curl", "-sS", "-L", "--compressed", "-m", str(timeout), "-A", ua]
+    for k, v in hdrs.items():
+        cmd += ["-H", f"{k}: {v}"]
+    if cookies:
+        cmd += ["-b", "; ".join(f"{k}={v}" for k, v in cookies.items())]
+    with tempfile.NamedTemporaryFile(suffix=".body") as tf:
+        cmd += ["-o", tf.name, "-w", "%{http_code}\t%{url_effective}", url]
+        try:
+            proc = subprocess.run(cmd, capture_output=True, text=True,
+                                  timeout=timeout + 10)
+        except Exception as e:
+            print(f"    ✗ curl failed: {e}")
+            return 0, "", url
+        meta = (proc.stdout or "").strip().split("\t")
+        status = int(meta[0]) if meta and meta[0].isdigit() else 0
+        final_url = meta[1] if len(meta) > 1 else url
+        tf.seek(0)
+        text = tf.read().decode("utf-8", errors="replace")
+    return status, text, final_url
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
@@ -226,10 +268,20 @@ def discover_sitemap(source_cfg: dict) -> list[tuple[str, str, str]]:
     path_exclude = source_cfg.get("path_exclude", "")
     sub_filter = source_cfg.get("sub_sitemap_filter", "")
     cutoff = parse_since(source_cfg.get("since"))
+    fetcher = source_cfg.get("fetcher", "")
     headers = {"User-Agent": DEFAULT_USER_AGENT}
-    r = requests.get(url, headers=headers, timeout=HTTP_TIMEOUT)
-    r.raise_for_status()
-    body = r.text
+
+    def _get_text(u: str) -> str:
+        if fetcher == "curl":
+            status, text, final = _curl_get(u, headers=headers)
+            if status != 200:
+                raise RuntimeError(f"curl HTTP {status} for {final}")
+            return text
+        r = requests.get(u, headers=headers, timeout=HTTP_TIMEOUT)
+        r.raise_for_status()
+        return r.text
+
+    body = _get_text(url)
 
     if "<sitemapindex" in body[:500].lower():
         sub_locs = re.findall(r"<sitemap[^>]*>\s*<loc[^>]*>([^<]+)</loc>", body, re.IGNORECASE)
@@ -238,9 +290,7 @@ def discover_sitemap(source_cfg: dict) -> list[tuple[str, str, str]]:
         out: list[tuple[str, str, str]] = []
         for sub in sub_locs:
             try:
-                sr = requests.get(sub, headers=headers, timeout=HTTP_TIMEOUT)
-                sr.raise_for_status()
-                out.extend(_parse_urlset(sr.text, path_filter, cutoff,
+                out.extend(_parse_urlset(_get_text(sub), path_filter, cutoff,
                                           sitemap_url=sub, path_exclude=path_exclude))
             except Exception as e:
                 print(f"    ⚠ sub-sitemap fetch failed for {sub}: {e}")
@@ -282,8 +332,13 @@ def _parse_urlset(body: str, path_filter: str, cutoff=None, since_label=None,
                 u = host_prefix + ("" if u.startswith("/") else "/") + u
         if path_filter and path_filter not in u:
             continue
-        if path_exclude and path_exclude in u:
-            continue
+        if path_exclude:
+            # Accept either a single substring or a list of substrings, so a
+            # source can drop several non-article path families at once
+            # (e.g. Replit's /blog/author/ and /blog/category/ listing pages).
+            excludes = [path_exclude] if isinstance(path_exclude, str) else path_exclude
+            if any(ex in u for ex in excludes):
+                continue
         # Skip the index pages themselves (e.g. /news, /blog with no trailing path)
         if u.rstrip("/").endswith(path_filter.rstrip("/")):
             continue
@@ -665,16 +720,20 @@ def discover_hf_papers(source_cfg: dict) -> list[tuple]:
 
 # ── Article fetch + extract ───────────────────────────────────────────────────
 
-def fetch_and_extract(url: str, sid: Optional[str] = None) -> Optional[tuple[str, dict]]:
+def fetch_and_extract(url: str, sid: Optional[str] = None,
+                      fetcher: str = "") -> Optional[tuple[str, dict]]:
     """Return (markdown_body, metadata_dict) or None on failure.
 
-    Always uses `requests.get` (not trafilatura's bundled fetcher) because:
+    Defaults to `requests.get` (not trafilatura's bundled fetcher) because:
       - requests transparently follows 30x redirects (trafilatura's urllib
         fetcher silently returns empty on some redirect chains — e.g. DeepMind's
         deepmind.google → blog.google redirects)
       - Surfaces explicit HTTP status codes for failure diagnosis instead of
         an opaque "empty body"
       - Trivially supports `connect.sid` cookie auth for Substack paywall bypass
+
+    Sources that set `fetcher = "curl"` route through `_curl_get` instead, for
+    sites behind TLS-fingerprinting bot challenges that 403 requests (Vercel).
 
     Note on Substack auth: `connect.sid` is the express-session cookie set by
     each publication's custom domain (e.g. www.latent.space). The substack.com
@@ -684,18 +743,26 @@ def fetch_and_extract(url: str, sid: Optional[str] = None) -> Optional[tuple[str
     """
     headers = {"User-Agent": DEFAULT_USER_AGENT}
     cookies = {"connect.sid": sid} if sid else None
-    try:
-        r = requests.get(
-            url, headers=headers, cookies=cookies,
-            timeout=HTTP_TIMEOUT, allow_redirects=True,
-        )
-    except Exception as e:
-        print(f"    ✗ fetch failed: {e}")
-        return None
-    if not r.ok:
-        print(f"    ✗ HTTP {r.status_code} from {r.url}")
-        return None
-    downloaded = r.text
+    if fetcher == "curl":
+        # Bot-challenge sites (see _curl_get): route the article fetch through
+        # curl too, otherwise we'd discover URLs but 403 on every body.
+        status, downloaded, final_url = _curl_get(url, headers=headers, cookies=cookies)
+        if status != 200:
+            print(f"    ✗ HTTP {status} from {final_url}")
+            return None
+    else:
+        try:
+            r = requests.get(
+                url, headers=headers, cookies=cookies,
+                timeout=HTTP_TIMEOUT, allow_redirects=True,
+            )
+        except Exception as e:
+            print(f"    ✗ fetch failed: {e}")
+            return None
+        if not r.ok:
+            print(f"    ✗ HTTP {r.status_code} from {r.url}")
+            return None
+        downloaded = r.text
     if not downloaded:
         print(f"    ✗ fetch returned empty")
         return None
@@ -990,7 +1057,8 @@ def process_source(source: str, source_cfg: dict, defaults: dict,
             if source_cfg.get("type") == "static-markdown-spa":
                 extracted = fetch_markdown_passthrough(url)
             else:
-                extracted = fetch_and_extract(url, sid=source_cfg.get("sid"))
+                extracted = fetch_and_extract(url, sid=source_cfg.get("sid"),
+                                               fetcher=source_cfg.get("fetcher", ""))
             if not extracted:
                 # Bump the per-URL failure counter; promote to .failed at threshold.
                 attempts[url] = attempts.get(url, 0) + 1

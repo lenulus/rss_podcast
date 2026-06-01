@@ -114,10 +114,12 @@ type = "sitemap"
 sitemap_url = "https://www.anthropic.com/sitemap.xml"
 path_filter = "/news/"
 
+# /sitemap.xml 404s; robots.txt points at /sitemap-index.xml. The host-qualified
+# path_filter keeps the English /news/ posts and drops localized /fr/news/, /it/news/.
 [sources.mistral]
 type = "sitemap"
-sitemap_url = "https://mistral.ai/sitemap.xml"
-path_filter = "/news/"
+sitemap_url = "https://mistral.ai/sitemap-index.xml"
+path_filter = "mistral.ai/news/"
 
 [sources.xai]
 type = "sitemap"
@@ -155,6 +157,56 @@ type = "sitemap"
 sitemap_url = "https://cursor.com/sitemap.xml"
 path_filter = "/blog/"
 path_exclude = "/blog/topic/"
+
+# LangChain — no RSS (the old blog.langchain.dev 301s to www.langchain.com/blog).
+# Webflow site, server-rendered; ~428 flat /blog/<slug> posts, no category
+# subpaths to exclude. The bare /blog index is skipped by the index-page check.
+[sources.langchain]
+type = "sitemap"
+sitemap_url = "https://www.langchain.com/sitemap.xml"
+path_filter = "/blog/"
+
+# OpenRouter — Next.js, no RSS. The blog lives at /announcements/ (~61 posts).
+# Server-rendered enough that trafilatura pulls a clean body.
+[sources.openrouter]
+type = "sitemap"
+sitemap_url = "https://openrouter.ai/sitemap.xml"
+path_filter = "/announcements/"
+
+# Replit — blog.replit.com is an empty SPA shell; the real posts are at
+# replit.com/blog/<slug> (sitemap linked from replit.com/robots.txt). path_exclude
+# also accepts a LIST of substrings — here it drops both listing-page families,
+# /blog/author/ and /blog/category/, which have no shared substring.
+[sources.replit]
+type = "sitemap"
+sitemap_url = "https://replit.com/blog/sitemap.xml"
+path_filter = "/blog/"
+path_exclude = ["/blog/author/", "/blog/category/"]
+
+# Vercel — fronts the site with a "Security Checkpoint" that TLS-fingerprints
+# the client and 403s Python's requests / trafilatura (X-Vercel-Mitigated:
+# challenge) on both the sitemap and every article. `fetcher = "curl"` routes
+# this source's fetches through the system curl binary, whose TLS handshake
+# passes regardless of User-Agent. The combined /blog/rss.xml Atom feed also
+# interleaves /changelog/ product notes and is challenged too, so we use the
+# sitemap (blog-only, ~539 of ~6848 URLs) and exclude /blog/category/.
+[sources.vercel]
+type = "sitemap"
+sitemap_url = "https://vercel.com/sitemap.xml"
+path_filter = "/blog/"
+path_exclude = ["/blog/category/"]
+fetcher = "curl"
+
+# UK AI Security Institute (AISI) — frontier-model evals, cyber/autonomous
+# capability, agent safety, red teaming. No RSS; the sitemap (served as
+# application/rss+xml but it's a plain urlset) has 73 flat /blog/<slug> posts.
+# /category/ index pages are top-level, not under /blog/, so no path_exclude
+# needed. (~44 /research/ report pages exist too — add path_filter "/research/"
+# as a second source if you want them.)
+[sources.uk-aisi]
+type = "sitemap"
+sitemap_url = "https://www.aisi.gov.uk/sitemap.xml"
+path_filter = "/blog/"
 
 # ── Hugging Face Daily Papers ─────────────────────────────────────────────────
 # Curated AI/ML research papers via JSON API. Daily volume is ~10–20 new papers;

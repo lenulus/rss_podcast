@@ -14,6 +14,12 @@ Status, test plan, and pending work for the news ingestion pipeline. Keep this c
 - Backup namespacing: `<backup_path>/news/<source>/text/*.md` (under `news/` so it never collides with podcast feed slugs).
 - gitignored: `news/`, `news.toml`.
 
+### Shipped (later)
+
+- **`fetcher = "curl"` per-source option.** Routes a source's sitemap discovery + per-article fetch through the system `curl` binary instead of `requests`, for sites behind TLS-fingerprinting bot challenges (`_curl_get`). Landed for Vercel — see Known limitations below.
+- **`path_exclude` accepts a list.** Was a single substring; now also takes `["/a/", "/b/"]` to drop several non-article path families at once (Replit's `/blog/author/` + `/blog/category/`). String form is unchanged/backward-compatible.
+- **4 new sitemap sources:** `langchain` (`www.langchain.com/blog/`), `openrouter` (`/announcements/`), `replit` (`replit.com/blog/`, dual path_exclude), `vercel` (`/blog/`, `fetcher = "curl"`). Each smoke-tested `--limit 1` and hand-reviewed.
+
 ### Smoke-tested
 
 - **Sitemap path → Anthropic, 1 article.** End-to-end works: discovery (211 URLs), filter (path_filter `/news/`), fetch (132 KB HTML), trafilatura extract (~10 KB clean markdown, correct title + date), render, dedup append. Output reviewed by hand.
@@ -52,10 +58,19 @@ Smoke-test (`b1126o600`, 2026-05-17) discovered the issue. Sitemap discovery wor
 
 Disabled in `news.toml` / `news.example.toml` (commented out the `[sources.cohere]` block) until a fetch strategy lands. Options when we want to revisit, ordered by sanity:
 
+- **Try `fetcher = "curl"` first** (added 2026-05-31 for Vercel — see below). Cheap one-line config change; curl's TLS handshake defeats fingerprint-based blocks. But Cohere is the Cloudflare *JS-challenge* tier, which is harder than Vercel's TLS-fingerprint tier — curl alone may not be enough. Worth a 5-minute test before reaching for anything heavier.
 - **Skip permanently.** Cohere isn't critical signal for an AI-pipeline wiki. Document and forget.
 - **Use Playwright** (browser-driven fetch) as a fallback fetcher in `news.py` for explicitly-marked Cloudflare-protected sources. Reliable; ~100 MB dependency; only worth it if multiple sources are similarly affected.
 - **Cloudscraper / undetected-chromedriver.** Cat-and-mouse with Cloudflare's detection — works for a few months, then breaks. Not recommended unless we already have one of these in the stack for another reason.
 - **Tune request headers** to mimic a real browser more aggressively (full `Sec-Fetch-*` set). Cheap to try; often enough for less-aggressive Cloudflare configs, useless against the JS challenge tier.
+
+### Vercel — Security Checkpoint (resolved via `fetcher = "curl"`)
+
+Discovered 2026-05-31 while adding `[sources.vercel]`. Vercel fronts `vercel.com` with a "Security Checkpoint" that TLS-fingerprints the client: Python's `requests` and trafilatura's bundled fetcher both get a 403 challenge page (`X-Vercel-Mitigated: challenge`, `Server: Vercel`) on **both** the sitemap and every article body. User-Agent is irrelevant — a real Chrome UA still 403s. The block is on the TLS handshake, not headers.
+
+`curl` (and real browsers) pass the checkpoint regardless of UA, so the fix was a per-source `fetcher = "curl"` option: when set, `discover_sitemap` and `fetch_and_extract` shell out to `_curl_get` (system `curl -sS -L --compressed`) instead of `requests`. Far lighter than Playwright (no new dependency — curl is already on the box) and reliable as long as Vercel's block stays at the TLS-fingerprint tier. Verified end-to-end: 539 `/blog/` URLs discovered, articles extract cleanly. The `requests` path is unchanged for all other sources.
+
+Caveat: this defeats *fingerprint*-based blocks, not JS-challenge tiers (Cloudflare). If Vercel escalates to a JS challenge, curl will stop working and we're back to the Playwright option.
 
 ## Pending build work
 
