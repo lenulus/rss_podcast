@@ -264,16 +264,47 @@ def get_audio_url(entry) -> str | None:
     return None
 
 
-def download_file(url: str, path: Path) -> bool:
-    """Stream-download a file to disk. Returns True on success."""
+def _download_file_curl(url: str, path: Path) -> bool:
+    """Stream-download via the system curl binary. Returns True on success.
+
+    Opt-in fallback (per-feed `fetcher = "curl"`) for CDNs that 403 the
+    default python-requests User-Agent — notably Acast's sphinx/stitcher
+    hosts. curl's own default UA (curl/x.y.z) passes fine, so no browser
+    spoofing is needed. curl follows redirects (-L), fails on HTTP >=400
+    (-f), and streams straight to `path` (-o) so large mp3s never buffer in
+    memory. If a future CDN 403s curl's default UA too, escalate by adding a
+    browser UA, e.g. `-A "Mozilla/5.0 ... Chrome/... Safari/537.36"`.
+    """
+    import subprocess
+    cmd = [
+        "curl", "-fL", "--compressed", "-m", "1800",
+        "-o", str(path), url,
+    ]
+    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=1810)
+    if proc.returncode != 0:
+        err = (proc.stderr or "").strip().splitlines()
+        detail = err[-1] if err else f"curl exit {proc.returncode}"
+        raise RuntimeError(detail)
+    return True
+
+
+def download_file(url: str, path: Path, use_curl: bool = False) -> bool:
+    """Stream-download a file to disk. Returns True on success.
+
+    Defaults to python-requests. Set use_curl=True (per-feed `fetcher = "curl"`)
+    to route through the system curl binary instead, for CDNs that block the
+    requests User-Agent — see _download_file_curl.
+    """
     try:
-        with requests.get(url, stream=True, timeout=30) as r:
-            r.raise_for_status()
-            size = 0
-            with open(path, "wb") as f:
-                for chunk in r.iter_content(chunk_size=8192):
-                    f.write(chunk)
-                    size += len(chunk)
+        if use_curl:
+            _download_file_curl(url, path)
+        else:
+            with requests.get(url, stream=True, timeout=30) as r:
+                r.raise_for_status()
+                with open(path, "wb") as f:
+                    for chunk in r.iter_content(chunk_size=8192):
+                        f.write(chunk)
+        size = path.stat().st_size if path.exists() else 0
         mb = size / (1024 * 1024)
         print(f"    ✓ Saved: {path.name} ({mb:.1f} MB)")
         return True
@@ -1346,6 +1377,7 @@ def run_download(feed, args):
     limit = effective_limit(args)
     entries = filter_entries_by_since(feed.entries, args._feed_cfg)
     entries = sort_entries_by_order(entries, args._feed_cfg)
+    use_curl = (args._feed_cfg or {}).get("fetcher") == "curl"
     fetched = 0
 
     for entry in entries:
@@ -1369,7 +1401,7 @@ def run_download(feed, args):
         print(f"  → {stem}")
 
         out_path = out_dir / f"{stem}.mp3"
-        if download_file(audio_url, out_path):
+        if download_file(audio_url, out_path, use_curl=use_curl):
             try:
                 write_metadata_sidecar(out_path, extract_episode_metadata(entry, feed))
             except Exception as e:

@@ -26,6 +26,13 @@ rss = "https://api.substack.com/feed/podcast/XXXXXX/private-key.rss"
 # substack.sid cookie for paywalled transcripts.
 # sid = "..."
 
+# Audio download path. Defaults to python-requests. Set to "curl" for feeds
+# whose CDN 403s the requests User-Agent — notably Acast (sphinx/stitcher
+# hosts). curl's own default UA passes, so no browser spoofing is involved;
+# this just shells out to the system curl binary for the mp3 fetch. Leave
+# unset for the usual case (Substack, Megaphone, Simplecast, etc.).
+# fetcher = "curl"
+
 # Cap the number of mp3s kept locally in ./downloads/<tag>/.
 # Eviction runs after --download and --transcribe. Oldest mp3s go first,
 # but only mp3s that already have a transcript are eligible — the source
