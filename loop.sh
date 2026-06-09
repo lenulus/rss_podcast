@@ -130,5 +130,5 @@ while true; do
     # `|| true` so a single child non-zero exit (e.g. SIGTERM, transient
     # failure) doesn't abort the whole loop — the stuck-detection above
     # catches genuine progress failures.
-    "$SCRIPT_DIR/run.sh" --feed "$FEED" --transcribe --limit "$BATCH_SIZE" "${PASSTHROUGH[@]}" || true
+    "$SCRIPT_DIR/run.sh" --feed "$FEED" --transcribe --limit "$BATCH_SIZE" "${PASSTHROUGH[@]+"${PASSTHROUGH[@]}"}" || true
 done
