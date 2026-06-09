@@ -938,6 +938,46 @@ def save_diarization_cache(mp3_path: Path, transcript_dir: Path,
     cache.write_text(json.dumps([[t[0], t[1], t[2]] for t in turns]), encoding="utf-8")
 
 
+# ── Whisper engine ────────────────────────────────────────────────────────────
+#
+# We use mlx_whisper (official MLX port) rather than lightning_whisper_mlx.
+# lightning's batched decoder ships a deliberately weak anti-hallucination
+# fallback — a single temperature retry (0.0 → 1.0) and condition_on_previous_text
+# left on — which let Whisper repetition loops ("it's it's it's…", "and then and
+# then…") through across the whole corpus. mlx_whisper does the full escalating
+# temperature schedule (0.0, 0.2, … 1.0), re-decoding any segment whose
+# compression ratio or avg-logprob trips the loop thresholds, until it breaks
+# out. We also disable condition_on_previous_text so a loop in one window can't
+# seed the next. Slower than lightning's batching, but correct.
+
+MLX_MODEL_DIR = Path(__file__).resolve().parent / "mlx_models"
+
+
+class MlxWhisper:
+    """Adapter over mlx_whisper.transcribe exposing the .transcribe(audio_path=, language=)
+    interface the rest of ss.py expects (so transcribe_chunked and the reload logic are
+    engine-agnostic). Reuses the local ./mlx_models/<name> weights converted for
+    lightning_whisper_mlx — mlx_whisper.load_model falls back to weights.npz — and pulls
+    from HuggingFace (mlx-community/whisper-<name>-mlx) only if the local dir is absent.
+    """
+
+    def __init__(self, model: str):
+        local = MLX_MODEL_DIR / model
+        self.repo = str(local) if local.exists() else f"mlx-community/whisper-{model}-mlx"
+
+    def transcribe(self, audio_path, language=None):
+        import mlx_whisper
+        return mlx_whisper.transcribe(
+            audio_path,
+            path_or_hf_repo=self.repo,
+            language=language,
+            # Full escalating-temperature fallback + loop thresholds are the defaults;
+            # disabling previous-text conditioning is the extra loop guard.
+            condition_on_previous_text=False,
+            verbose=False,
+        )
+
+
 # ── Whisper chunked transcription ─────────────────────────────────────────────
 #
 # MLX/Metal trips a GPU command-buffer timeout on multi-hour audio (the mel
@@ -2030,7 +2070,7 @@ def _run_feed_via_subprocess(args, mp3_dir: Path, out_dir: Path,
 
 
 def run_transcribe(args):
-    """Transcribe mp3 files using Lightning Whisper MLX (Apple Silicon GPU)."""
+    """Transcribe mp3 files using mlx-whisper (Apple Silicon GPU)."""
     pairs = transcribe_pairs(args)
     config = getattr(args, "_config", {}) or {}
     diarize_only = bool(getattr(args, "diarize_only", False))
@@ -2139,10 +2179,9 @@ def run_transcribe(args):
         desired_batch = pair_batch.get(mp3_dir.name, 12)
         desired_model = pair_model.get(mp3_dir.name, "medium")
         if not diarize_only:
-            from lightning_whisper_mlx import LightningWhisperMLX
             if whisper is None or last_batch != desired_batch or last_model != desired_model:
-                print(f"Loading model '{desired_model}' (batch_size={desired_batch})...")
-                whisper = LightningWhisperMLX(model=desired_model, batch_size=desired_batch, quant=None)
+                print(f"Loading mlx-whisper model '{desired_model}'...")
+                whisper = MlxWhisper(model=desired_model)
                 last_batch = desired_batch
                 last_model = desired_model
 
@@ -2158,9 +2197,8 @@ def run_transcribe(args):
 
             # Re-hydrate models if a periodic reload nuked them. Cheap when not needed.
             if not diarize_only and whisper is None:
-                from lightning_whisper_mlx import LightningWhisperMLX
-                print(f"  ↻ Reloading Whisper '{desired_model}' (batch_size={desired_batch})...")
-                whisper = LightningWhisperMLX(model=desired_model, batch_size=desired_batch, quant=None)
+                print(f"  ↻ Reloading mlx-whisper '{desired_model}'...")
+                whisper = MlxWhisper(model=desired_model)
                 last_batch = desired_batch
                 last_model = desired_model
             want_diarize = pair_diarize.get(mp3_dir.name, False)

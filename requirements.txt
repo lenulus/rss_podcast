@@ -6,10 +6,12 @@ requests
 # canonical date discovery, and markdown output.
 trafilatura
 
-# lightning-whisper-mlx is installed with --no-deps in setup.sh because it
-# hard-pins tiktoken==0.3.3, which has no wheels past Python 3.11. Its
-# runtime deps are listed here with looser bounds so they resolve normally.
-# The Encoding API surface used by the library has been stable since 0.3.3.
+# mlx-whisper (official MLX Whisper port) is the transcription engine. We moved
+# off lightning-whisper-mlx because its batched decoder shipped a weak single-retry
+# temperature fallback that let Whisper repetition loops through; mlx-whisper does
+# the full escalating-temperature fallback. It resolves its own deps cleanly (no
+# tiktoken==0.3.3 pin), so no --no-deps dance is needed.
+mlx-whisper
 tiktoken>=0.7
 huggingface-hub
 mlx
