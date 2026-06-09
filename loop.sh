@@ -11,6 +11,19 @@
 # through to run.sh verbatim.
 set -uo pipefail
 
+# Keep the Mac awake for the whole run. macOS throttles background GPU/compute
+# (and can nap) when logged out with the display off — observed dropping
+# episodes from ~20x to ~1x realtime mid-batch, then snapping back on login.
+# That stalls long unattended/overnight runs. Re-exec under caffeinate so the
+# protection is automatic and self-reverts when the run ends (vs. permanently
+# disabling system sleep). -i no idle sleep, -m no disk sleep, -s no system
+# sleep on AC. The guard var prevents an infinite re-exec loop; we skip the
+# screen-awake (-d) assertion so the display can still turn off.
+if [ -z "${LOOP_CAFFEINATED:-}" ] && command -v caffeinate >/dev/null 2>&1; then
+    export LOOP_CAFFEINATED=1
+    exec caffeinate -ims "$0" "$@"
+fi
+
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
 FEED=""
