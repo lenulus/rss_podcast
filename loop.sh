@@ -95,25 +95,32 @@ for arg in "${PASSTHROUGH[@]:-}"; do
 done
 
 count_pending() {
+    # Count mp3s whose stem is NOT yet done. Must check stem membership, not
+    # (mp3_count - done_count): .processed (and the diarize cache) retain every
+    # episode ever handled, while most mp3s get pruned after transcription, so
+    # the subtraction goes negative for feeds with a deep history and a small
+    # local mp3 set — making the loop think there's nothing to do and bail.
     local feed="$1"
     local mp3_dir="$SCRIPT_DIR/downloads/$feed"
-    local mp3_count=0
-    if [ -d "$mp3_dir" ]; then
-        mp3_count=$(find "$mp3_dir" -maxdepth 1 -name '*.mp3' 2>/dev/null | wc -l | tr -d ' ')
-    fi
-    local done_count=0
-    if [ "$DIARIZE_ONLY" = true ]; then
-        local diarize_dir="$SCRIPT_DIR/transcripts/$feed/.diarize"
-        if [ -d "$diarize_dir" ]; then
-            done_count=$(find "$diarize_dir" -maxdepth 1 -name '*.json' 2>/dev/null | wc -l | tr -d ' ')
+    [ -d "$mp3_dir" ] || { echo 0; return; }
+
+    local processed="$SCRIPT_DIR/transcripts/$feed/.processed"
+    local diarize_dir="$SCRIPT_DIR/transcripts/$feed/.diarize"
+    local n=0 f stem
+    for f in "$mp3_dir"/*.mp3; do
+        [ -e "$f" ] || continue          # no matches → glob stays literal
+        stem=$(basename "$f" .mp3)
+        if [ "$DIARIZE_ONLY" = true ]; then
+            [ -f "$diarize_dir/$stem.json" ] || n=$((n + 1))
+        else
+            # grep -xF: exact whole-line, fixed-string (stems contain #, –, . etc.)
+            if [ -f "$processed" ] && grep -qxF -- "$stem" "$processed"; then
+                continue
+            fi
+            n=$((n + 1))
         fi
-    else
-        local processed="$SCRIPT_DIR/transcripts/$feed/.processed"
-        if [ -f "$processed" ]; then
-            done_count=$(wc -l < "$processed" | tr -d ' ')
-        fi
-    fi
-    echo $((mp3_count - done_count))
+    done
+    echo "$n"
 }
 
 MODE="transcribe"
