@@ -13,6 +13,9 @@ mlx_models/
 transcripts/
 news/
 
+# Local, point-in-time artifacts (audit CSVs, remediation plans, etc.)
+reports/
+
 # Environment
 .env
 .env.*

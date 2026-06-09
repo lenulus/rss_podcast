@@ -1132,9 +1132,17 @@ def load_processed(tag: str) -> set[str]:
 
 
 def record_processed(tag: str, stem: str) -> None:
-    """Append a stem to the feed's .processed index (called after a write)."""
+    """Append a stem to the feed's .processed index (called after a write).
+
+    Idempotent: a no-op if the stem is already indexed, so re-transcribing via
+    --reprocess doesn't leave duplicate lines.
+    """
     index = processed_index_path(tag)
     index.parent.mkdir(parents=True, exist_ok=True)
+    if index.exists():
+        existing = {ln.strip() for ln in index.read_text(encoding="utf-8").splitlines() if ln.strip()}
+        if stem in existing:
+            return
     with open(index, "a", encoding="utf-8") as f:
         f.write(f"{stem}\n")
 
@@ -2019,6 +2027,11 @@ def _run_feed_via_subprocess(args, mp3_dir: Path, out_dir: Path,
         ]
         if diarize_only:
             cmd.append("--diarize-only")
+        # Parent already selected this stem into `pending`; the child recomputes
+        # from .processed and would re-skip it without --reprocess. Bare form +
+        # the --only above forces exactly this one episode in the child.
+        if getattr(args, "reprocess", None) is not None:
+            cmd.append("--reprocess")
         if concurrency > 1:
             cmd.extend(["--label", f"[w{worker_id}]"])
         if args.diarize is not None:
@@ -2097,7 +2110,19 @@ def run_transcribe(args):
             existing = load_processed(tag)
         else:
             existing = {p.stem for p in out_dir.glob("*.md")} if out_dir.is_dir() else set()
-        to_process = [f for f in mp3s if f.stem not in existing]
+        # --reprocess forces episodes that are already in `existing` back into
+        # scope: a specific stem if given, else the whole feed. Diarize-only
+        # mode is left alone (its done-signal is the cache, not .processed).
+        reprocess = getattr(args, "reprocess", None)
+        if reprocess is not None and not diarize_only:
+            if reprocess != "__ALL__":
+                to_process = [f for f in mp3s if f.stem == reprocess]
+                if not to_process:
+                    print(f"  ⚠ --reprocess: no mp3 in {mp3_dir} matches stem '{reprocess}'")
+            else:
+                to_process = list(mp3s)
+        else:
+            to_process = [f for f in mp3s if f.stem not in existing]
         # --only <stem> narrows this run to a single episode by stem name.
         # Used by --subprocess-per-episode to dispatch specific episodes
         # from a parent's parallel queue without races.
@@ -2240,6 +2265,14 @@ def run_transcribe(args):
                 _release_memory()
                 continue
 
+            # On --reprocess, drop any leftover chunk checkpoint first — a stale
+            # one (e.g. from the old engine) would be reused verbatim and re-inject
+            # the very corruption we're re-transcribing to fix.
+            if getattr(args, "reprocess", None) is not None:
+                stale_cp = out_dir / ".chunks" / mp3_path.stem
+                if stale_cp.is_dir():
+                    shutil.rmtree(stale_cp, ignore_errors=True)
+
             t0 = time.time()
             result = transcribe_chunked(mp3_path, whisper, checkpoint_dir=out_dir / ".chunks")
             elapsed = time.time() - t0
@@ -2352,6 +2385,13 @@ def main():
                         help="Restrict --transcribe to a single mp3 by stem name. "
                              "Used internally by --subprocess-per-episode to dispatch "
                              "specific episodes to parallel workers without races.")
+    parser.add_argument("--reprocess", nargs="?", const="__ALL__", default=None, metavar="STEM",
+                        help="Re-transcribe episodes even if already in .processed, overwriting "
+                             "the .md in place and ignoring any stale chunk checkpoint. With a "
+                             "STEM value, redo just that episode; bare, redo the whole feed in "
+                             "scope. Pairs with --feed / --only / --limit. Does NOT fetch audio — "
+                             "the mp3 must already be in downloads/<feed>/ (use reprocess.py to "
+                             "restore from backup for batch jobs).")
     parser.add_argument("--label", default=None,
                         help="Prefix every stdout line with the given text. Used internally "
                              "to distinguish concurrent transcribe subprocesses in the parent's "
