@@ -2000,7 +2000,13 @@ def _run_feed_via_subprocess(args, mp3_dir: Path, out_dir: Path,
     # Snapshot the actually-pending set now and respect limit_remaining upfront.
     # Concurrency requires explicit per-worker --only assignment; doing it here
     # ahead of dispatch keeps the loop race-free.
-    pending = [f for f in to_process if not is_done(f.stem)]
+    # Under --reprocess the parent's to_process is authoritative (the stems were
+    # deliberately forced even though they're already in .processed) — skip the
+    # is_done re-filter, which would otherwise drop them right back out.
+    if getattr(args, "reprocess", None) is not None:
+        pending = list(to_process)
+    else:
+        pending = [f for f in to_process if not is_done(f.stem)]
     if limit_remaining is not None:
         pending = pending[:limit_remaining]
     total = len(pending)
@@ -2164,16 +2170,12 @@ def run_transcribe(args):
     last_batch: int | None = None
     last_model: str | None = None
 
-    # Only load diarize pipeline upfront for feeds that run in-process — subprocess-mode
-    # feeds load their own pipeline inside each child process.
+    # pyannote loads lazily — only on an actual diarization cache MISS (see the
+    # per-episode block below). The pipeline pulls in torch + a ~5 GB working set,
+    # which is pure waste when every episode is a cache hit (the common case once
+    # a feed has been diarized once, e.g. re-transcription runs). Deferring the
+    # load to the first miss keeps cache-hit runs lean and torch-free.
     diarization_pipeline = None
-    in_process_diarize_needed = any(
-        pair_diarize.get(d.name, False) and not pair_subprocess.get(d.name, False)
-        for d, _, _ in plan
-    )
-    if in_process_diarize_needed:
-        print("Loading diarization pipeline (pyannote)...")
-        diarization_pipeline = load_diarization_pipeline()
 
     total_done = 0
 
@@ -2227,24 +2229,26 @@ def run_transcribe(args):
                 last_batch = desired_batch
                 last_model = desired_model
             want_diarize = pair_diarize.get(mp3_dir.name, False)
-            if want_diarize and diarization_pipeline is None:
-                print(f"  ↻ Reloading diarization pipeline (pyannote)...")
-                diarization_pipeline = load_diarization_pipeline()
 
             audio_dur = get_audio_duration_secs(mp3_path)
             dur_str = format_duration(str(int(audio_dur))) if audio_dur else "??:??"
-            do_diarize = want_diarize and diarization_pipeline is not None
-            mode_marker = " (diarize-only)" if diarize_only else (" (with diarization)" if do_diarize else "")
+            mode_marker = " (diarize-only)" if diarize_only else (" (with diarization)" if want_diarize else "")
             print(f"  [{i}/{len(to_process)}] Transcribing{mode_marker} ({dur_str}): {mp3_path.name}")
 
             speaker_turns = None
-            if do_diarize:
+            if want_diarize:
                 cached = load_cached_diarization(mp3_path, out_dir)
                 if cached is not None:
                     speaker_turns = cached
                     n_speakers = len(set(t[2] for t in speaker_turns))
                     print(f"    ✓ Diarization (cached) — {n_speakers} speaker(s), {len(speaker_turns)} turn(s)")
                 else:
+                    # Cache miss — load pyannote now (deferred to here so cache-hit
+                    # episodes skip the ~5 GB torch pipeline entirely; see the note
+                    # where diarization_pipeline is declared).
+                    if diarization_pipeline is None:
+                        print(f"    ↻ Loading diarization pipeline (pyannote)...")
+                        diarization_pipeline = load_diarization_pipeline()
                     t_d = time.time()
                     try:
                         speaker_turns = diarize_audio(mp3_path, diarization_pipeline)
@@ -2299,7 +2303,7 @@ def run_transcribe(args):
                 aligned = align_segments_to_speakers(segments, speaker_turns)
                 content = render_diarized_markdown(mp3_path.stem, aligned, meta, host_name=host_display)
             else:
-                if do_diarize and not segments:
+                if want_diarize and not segments:
                     print(f"    ⚠ Whisper returned no segments — saving flat transcript.")
                 content = render_flat_markdown(mp3_path.stem, text, meta)
             out_path.write_text(content, encoding="utf-8")
