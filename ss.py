@@ -493,6 +493,33 @@ def collapse_repetitions(text: str, threshold: int = REPETITION_THRESHOLD) -> st
     return " ".join(out)
 
 
+# A Whisper decoder loop ("it's it's it's…", or a sentence re-emitted dozens of
+# times) is the failure mode that motivated the mlx-whisper switch. It survives
+# collapse_repetitions when the loop is sub-sentence or split across speaker
+# turns, so we also score it post-transcription and warn loudly. The threshold
+# separates real loops (typically 5–45% of tokens trapped) from the legitimate
+# repetition of natural speech and recap-heavy shows (< ~4%).
+REPETITION_WARN_FRACTION = 0.08
+
+
+def repetition_fraction(text: str, n: int = 8, threshold: int = 3) -> float:
+    """Fraction of tokens (0.0–1.0) trapped in an n-gram repeated >= `threshold` times.
+
+    A cheap proxy for decoder loops. IMPORTANT: pass the spoken transcript text
+    ONLY — never a rendered .md, whose metadata/show-notes header is dense,
+    repetitively formatted, and would inflate the score (the body vs header
+    distinction that made naive whole-file scans over-report). At transcription
+    time the raw Whisper text is exactly the body, so callers there are safe.
+    """
+    words = re.findall(r"\w+", text.lower())
+    if len(words) <= n:
+        return 0.0
+    from collections import Counter
+    grams = Counter(tuple(words[i:i + n]) for i in range(len(words) - n))
+    looped = sum(c for _, c in grams.items() if c >= threshold)
+    return looped / len(words)
+
+
 # ── Memory hygiene ────────────────────────────────────────────────────────────
 #
 # Long transcribe runs (hundreds of multi-hour episodes) accumulate Python heap
@@ -914,28 +941,75 @@ def diarize_cache_path(mp3_path: Path, transcript_dir: Path) -> Path:
     return transcript_dir / ".diarize" / f"{mp3_path.stem}.json"
 
 
+def _audio_fingerprint(mp3_path: Path) -> dict:
+    """Cheap, re-fetch-stable fingerprint of an audio file: size + sha256.
+
+    Used to validate the diarization cache by content rather than mtime, so the
+    cache survives any byte-identical re-fetch (re-download, plain `cp`, restore
+    without -p) — none of which preserve mtime. The hash is one streamed read,
+    negligible next to transcription, and only computed for episodes we're about
+    to transcribe anyway.
+    """
+    import hashlib
+    h = hashlib.sha256()
+    with open(mp3_path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return {"size": mp3_path.stat().st_size, "sha256": h.hexdigest()}
+
+
 def load_cached_diarization(mp3_path: Path, transcript_dir: Path) -> list[tuple[float, float, str]] | None:
-    """Return cached turns if the sidecar exists and is newer than the mp3."""
+    """Return cached pyannote turns if the sidecar is valid for this mp3, else None.
+
+    New caches store an audio fingerprint and are validated by content (size,
+    then sha256) — robust against re-fetches that change mtime. Legacy caches are
+    a bare turns list with no fingerprint; those fall back to the original mtime
+    check (cache must be at least as new as the mp3). The format is detected by
+    shape: dict = new, list = legacy.
+    """
     import json
     cache = diarize_cache_path(mp3_path, transcript_dir)
     if not cache.exists():
         return None
-    if cache.stat().st_mtime < mp3_path.stat().st_mtime:
-        return None  # mp3 changed since we cached
     try:
         data = json.loads(cache.read_text(encoding="utf-8"))
-        return [(float(t[0]), float(t[1]), str(t[2])) for t in data]
     except Exception:
+        return None
+
+    if isinstance(data, dict):  # new fingerprinted format
+        fp = data.get("audio") or {}
+        turns = data.get("turns")
+        try:
+            if fp.get("size") != mp3_path.stat().st_size:
+                return None
+            if fp.get("sha256") and fp["sha256"] != _audio_fingerprint(mp3_path)["sha256"]:
+                return None
+        except OSError:
+            return None
+    else:  # legacy bare-list format → mtime fallback
+        turns = data
+        if cache.stat().st_mtime < mp3_path.stat().st_mtime:
+            return None  # mp3 changed since we cached
+
+    try:
+        return [(float(t[0]), float(t[1]), str(t[2])) for t in turns]
+    except (TypeError, ValueError, IndexError):
         return None
 
 
 def save_diarization_cache(mp3_path: Path, transcript_dir: Path,
                            turns: list[tuple[float, float, str]]) -> None:
-    """Persist diarization turns as a JSON sidecar so future retries skip the work."""
+    """Persist diarization turns + an audio fingerprint so future runs skip the work.
+
+    Writes the fingerprinted format ({"audio": {...}, "turns": [...]}); see
+    load_cached_diarization for how it's validated.
+    """
     import json
     cache = diarize_cache_path(mp3_path, transcript_dir)
     cache.parent.mkdir(parents=True, exist_ok=True)
-    cache.write_text(json.dumps([[t[0], t[1], t[2]] for t in turns]), encoding="utf-8")
+    payload = {"audio": _audio_fingerprint(mp3_path),
+               "turns": [[t[0], t[1], t[2]] for t in turns]}
+    cache.write_text(json.dumps(payload), encoding="utf-8")
 
 
 # ── Whisper engine ────────────────────────────────────────────────────────────
@@ -2289,6 +2363,15 @@ def run_transcribe(args):
             words = len(text.split())
             speed = audio_dur / elapsed if audio_dur else 0
             print(f"    ✓ {words} words in {elapsed:.1f}s ({speed:.1f}x realtime)")
+
+            # Body-only repetition check (text is the raw transcript, no header) —
+            # flags Whisper decoder loops so a bad episode is caught now, not weeks
+            # later. We warn rather than block: legitimate repetition exists, and
+            # the user can re-transcribe (--reprocess) a flagged stem.
+            rep = repetition_fraction(text)
+            if rep >= REPETITION_WARN_FRACTION:
+                print(f"    ⚠ High repetition: {rep*100:.0f}% of words are in repeated phrases "
+                      f"— likely a Whisper loop. Review or re-transcribe (--reprocess).")
 
             out_path = out_dir / f"{mp3_path.stem}.md"
             segments = result.get("segments") or []
