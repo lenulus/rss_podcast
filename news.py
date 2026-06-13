@@ -162,6 +162,39 @@ def record_processed(source: str, url: str) -> None:
         f.write(url + "\n")
 
 
+def _url_keys(url: str) -> tuple[str, str]:
+    """Two dedup keys for a URL: (full_key, slug_key).
+
+    full_key  — scheme-insensitive 'host/path' with any trailing slash stripped,
+                so 'https://x/a', 'http://x/a' and '…/a/' collapse together.
+    slug_key  — 'host|<final-path-segment>'. This stays stable when a site
+                restructures its path *prefix* — e.g. OpenRouter moving
+                '/announcements/x' → '/blog/announcements/x/', which once made
+                every article look new and re-fetched the whole archive.
+
+    The slug fallback assumes final path segments are unique per host (true for
+    these blogs' descriptive slugs). The cost of a false match is skipping one
+    genuinely-new post that reuses an old slug; the cost of no fallback is a
+    full re-fetch on any prefix change. We take the former.
+    """
+    from urllib.parse import urlsplit
+    s = urlsplit(url.strip())
+    host = (s.netloc or "").lower()
+    full = f"{host}{s.path.rstrip('/')}"
+    return full, f"{host}|{slug_from_url(url)}"
+
+
+def load_seen(source: str) -> tuple[set[str], set[str]]:
+    """(full_keys, slug_keys) for every URL recorded in .processed."""
+    full: set[str] = set()
+    slug: set[str] = set()
+    for u in load_processed(source):
+        f, s = _url_keys(u)
+        full.add(f)
+        slug.add(s)
+    return full, slug
+
+
 def failed_path(source: str) -> Path:
     return Path(f"./news/{source}/.failed")
 
@@ -1014,9 +1047,14 @@ def process_source(source: str, source_cfg: dict, defaults: dict,
         print(f"  ✗ discovery failed: {e}")
         return
     print(f"  discovered: {len(discovered)} URL(s)")
-    seen = load_processed(source)
+    seen_full, seen_slug = load_seen(source)
     failed = load_failed(source)
-    pending = [t for t in discovered if t[0] not in seen and t[0] not in failed]
+
+    def _is_seen(url: str) -> bool:
+        f, s = _url_keys(url)
+        return f in seen_full or s in seen_slug
+
+    pending = [t for t in discovered if not _is_seen(t[0]) and t[0] not in failed]
     if failed:
         print(f"  pending (not in .processed): {len(pending)}  (skipping {len(failed)} in .failed)")
     else:
