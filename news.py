@@ -857,7 +857,11 @@ def slug_from_url(url: str) -> str:
     tail = tail.split("?", 1)[0].split("#", 1)[0]
     # Strip a single trailing file extension (.md / .html / .htm / .json …).
     # Otherwise sanitization turns "foo.md" into "foo-md" which is ugly.
-    tail = re.sub(r"\.[a-z0-9]{1,5}$", "", tail, flags=re.IGNORECASE)
+    # The extension must start with a letter — otherwise arxiv-style ids like
+    # "2606.19195" lose their minor number, collapsing every "2606.*" paper to
+    # the slug "2606" and breaking slug-key dedup (all of a month's HF papers
+    # would look identical). Real extensions (.md/.html/.json) start with a letter.
+    tail = re.sub(r"\.[a-z][a-z0-9]{0,4}$", "", tail, flags=re.IGNORECASE)
     safe = re.sub(r"[^a-z0-9-]+", "-", tail.lower()).strip("-")
     if not safe:
         safe = hashlib.sha1(url.encode()).hexdigest()[:10]
