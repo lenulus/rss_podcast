@@ -918,13 +918,63 @@ def _slug_from_text(s: str, limit: int = 60) -> str:
     return safe[:limit] or "untitled"
 
 
-def render_hf_paper(source: str, payload: dict) -> tuple[Path, str, str]:
+ARXIV_HTML = "https://arxiv.org/html/{aid}"
+AR5IV_HTML = "https://ar5iv.org/abs/{aid}"
+
+
+def fetch_arxiv_fulltext(arxiv_id: str) -> Optional[tuple[str, str]]:
+    """Best-effort full paper text from arxiv's HTML render (ar5iv fallback).
+
+    Returns (markdown_body, source_url) or None. Many papers have no HTML
+    rendering — arxiv then 30x-redirects /html/<id> to the /abs/ landing page,
+    which we detect via the final URL and treat as "no full text" (the abstract
+    is already in the md). Extraction is via trafilatura, same as article
+    bodies; it strips LaTeX/nav cruft but is not pixel-perfect — figures, math,
+    and tables degrade. That's acceptable for an appendix/reference use.
+    """
+    headers = {"User-Agent": DEFAULT_USER_AGENT}
+    for tmpl in (ARXIV_HTML, AR5IV_HTML):
+        url = tmpl.format(aid=arxiv_id)
+        try:
+            r = requests.get(url, headers=headers, timeout=HTTP_TIMEOUT, allow_redirects=True)
+        except Exception as e:
+            print(f"    ⚠ full-text fetch failed ({url}): {e}")
+            continue
+        if not r.ok or "/abs/" in r.url:
+            continue  # no HTML rendering at this host
+        try:
+            body = trafilatura.extract(r.text, output_format="markdown",
+                                       include_formatting=True, favor_recall=True)
+        except Exception as e:
+            print(f"    ⚠ full-text extract failed ({url}): {e}")
+            body = None
+        if body and len(body.strip()) > 1000:
+            return body.strip(), r.url
+    return None
+
+
+def _trim_paper_body(body: str, max_chars: int = 40000) -> tuple[str, bool]:
+    """Drop a trailing References/Bibliography/Acknowledgments section and cap
+    length. Returns (trimmed_body, was_truncated)."""
+    m = re.search(r"\n#+\s*(references|bibliography|acknowledg)", body, re.IGNORECASE)
+    if m:
+        body = body[: m.start()].rstrip()
+    if len(body) > max_chars:
+        return body[:max_chars].rstrip(), True
+    return body, False
+
+
+def render_hf_paper(source: str, payload: dict,
+                    fulltext: Optional[tuple[str, str]] = None) -> tuple[Path, str, str]:
     """Render an HF Daily Papers entry to markdown.
 
     Differs from render_article in two ways: no trafilatura body (we already
     have the structured payload), and the frontmatter is `type: paper` with
     arxiv-specific fields (arxiv_id, project_page, authors list, organization,
     upvotes, ai_keywords as tags).
+
+    `fulltext`, when provided, is (markdown_body, source_url) from
+    fetch_arxiv_fulltext — appended as a best-effort "Full text" section.
     """
     fetched_iso = datetime.now(timezone.utc).isoformat()
     arxiv_id = payload["arxiv_id"]
@@ -978,7 +1028,22 @@ def render_hf_paper(source: str, payload: dict) -> tuple[Path, str, str]:
         body_parts.extend(["## TL;DR (HF auto-summary)", "", payload["ai_summary"], ""])
     if payload.get("summary"):
         body_parts.extend(["## Abstract", "", payload["summary"], ""])
+    if fulltext:
+        ft_body, ft_url = fulltext
+        ft_body, truncated = _trim_paper_body(ft_body)
+        body_parts.extend([
+            "## Full text (best-effort extraction)",
+            "",
+            f"_Extracted from {ft_url} via trafilatura; figures, math, and tables "
+            "may be imperfect. References section dropped." +
+            (" Truncated for length." if truncated else "") + "_",
+            "",
+            ft_body,
+            "",
+        ])
 
+    # full_text frontmatter flag goes near the other metadata, before tags.
+    fm_lines.insert(fm_lines.index("tags:"), f"full_text: {'true' if fulltext else 'false'}")
     content = "\n".join(fm_lines) + "\n".join(body_parts).rstrip() + "\n"
     return out_path, content, published_iso
 
@@ -1092,8 +1157,13 @@ def process_source(source: str, source_cfg: dict, defaults: dict,
         print(f"\n  [{i}/{len(pending)}] {url}")
         if payload is not None:
             # HF paper path: payload carries the full normalized JSON already;
-            # no per-article fetch + trafilatura step.
-            out_path, content, published = render_hf_paper(source, payload)
+            # no per-article fetch + trafilatura step. Optionally pull the full
+            # paper text from arxiv's HTML render (best-effort) when configured.
+            fulltext = None
+            if source_cfg.get("fetch_fulltext"):
+                fulltext = fetch_arxiv_fulltext(payload["arxiv_id"])
+                print("    + full text captured" if fulltext else "    · no HTML full text available")
+            out_path, content, published = render_hf_paper(source, payload, fulltext=fulltext)
             body_len = len(payload.get("summary", "") or "") + len(payload.get("ai_summary", "") or "")
         else:
             if source_cfg.get("type") == "static-markdown-spa":

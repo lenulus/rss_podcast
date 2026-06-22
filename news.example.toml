@@ -217,6 +217,8 @@ discovery_mode = "daily-api"      # "daily-api" (50 most-recent) or "weekly-html
 min_upvotes = 10                  # community-endorsement floor; filtered papers stay re-checkable
 top_n = 5                         # per-poll cap after sorting (upvotes DESC, then submittedOnDailyAt DESC)
 fetch_delay_seconds = 0.5         # HF API is fast; minimal politeness delay
+fetch_fulltext = true             # also pull each paper's full text from arxiv's HTML render
+                                  # (best-effort trafilatura; papers w/o HTML keep just the abstract)
 
 # ── Static-markdown SPAs (Angular/React sites serving raw .md files) ─────────
 # Some publishers ship a JS-only client app that fetches blog posts as static
