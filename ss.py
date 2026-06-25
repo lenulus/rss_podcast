@@ -166,7 +166,9 @@ def sanitize_filename(title: str) -> str:
     """Strip characters that are unsafe in filenames, collapse whitespace."""
     safe = re.sub(r'[<>:"/\\|?*\x00-\x1f]', '', title)
     safe = re.sub(r'\s+', ' ', safe).strip()
-    return safe[:120]
+    # rstrip AFTER truncation: a 120-char cut can land on a space, leaving a
+    # trailing space that breaks stem matching against the .processed ledger.
+    return safe[:120].rstrip()
 
 
 def pub_date_to_iso(entry) -> str:
