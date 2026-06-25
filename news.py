@@ -34,6 +34,11 @@ import trafilatura
 DEFAULT_FETCH_DELAY = 1.5
 DEFAULT_USER_AGENT = "Mozilla/5.0 (Macintosh; ss-news/1.0) Gecko/Firefox"
 HTTP_TIMEOUT = 20
+# When trafilatura.extract() returns nothing, fall back to html2txt only if it
+# lifts at least this many chars — enough to clear nav/footer chrome and prove a
+# real article body exists, while client-rendered SPA shells (which yield ~0)
+# stay failed rather than being captured as junk.
+HTML2TXT_FALLBACK_MIN_CHARS = 500
 
 
 def _curl_get(url: str, headers: Optional[dict] = None,
@@ -811,8 +816,23 @@ def fetch_and_extract(url: str, sid: Optional[str] = None,
         print(f"    ✗ extract failed: {e}")
         return None
     if not body or not body.strip():
-        print(f"    ✗ extract returned empty body")
-        return None
+        # trafilatura's content-density heuristic rejects some real articles
+        # outright (e.g. certain Webflow CMS layouts), returning None even with
+        # favor_recall — yet the body text is plainly present in the static
+        # HTML. Fall back to html2txt, which lifts ALL visible text (nav/footer
+        # chrome included) rather than nothing. This is lower-fidelity, so only
+        # use it as a last resort and only when it yields a substantial amount
+        # of text — client-rendered SPA shells return ~empty here, so they stay
+        # failed instead of being captured as junk. Because this path is reached
+        # only after extract() fully fails, it cannot regress articles that
+        # already extract cleanly.
+        fallback = (trafilatura.html2txt(downloaded) or "").strip()
+        if len(fallback) >= HTML2TXT_FALLBACK_MIN_CHARS:
+            print(f"    ⚠ extract empty — html2txt fallback ({len(fallback)} chars, low fidelity)")
+            body = fallback
+        else:
+            print(f"    ✗ extract returned empty body")
+            return None
     meta = trafilatura.extract_metadata(downloaded)
     meta_dict = {
         "title": (meta.title if meta and meta.title else "").strip(),
