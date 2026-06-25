@@ -162,13 +162,27 @@ def sort_entries_by_order(entries, feed_cfg: dict):
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
+def _nfc(s: str) -> str:
+    """Normalize a string to Unicode NFC (composed) form.
+
+    macOS stores filenames in NFD (decomposed: e.g. 'o' + combining diaeresis),
+    while RSS titles arrive in NFC ('ö'). Stems derived from a filesystem glob
+    therefore never compare equal to stems derived from a feed title for any
+    accented episode — silently breaking dedup (endless re-downloads) and
+    skip-already-done checks. Funnel every stem through this so all comparisons
+    happen in one normal form.
+    """
+    return unicodedata.normalize("NFC", s)
+
+
 def sanitize_filename(title: str) -> str:
     """Strip characters that are unsafe in filenames, collapse whitespace."""
     safe = re.sub(r'[<>:"/\\|?*\x00-\x1f]', '', title)
     safe = re.sub(r'\s+', ' ', safe).strip()
     # rstrip AFTER truncation: a 120-char cut can land on a space, leaving a
     # trailing space that breaks stem matching against the .processed ledger.
-    return safe[:120].rstrip()
+    # NFC so a title-derived stem matches an on-disk (NFD) name after normalize.
+    return _nfc(safe[:120].rstrip())
 
 
 def pub_date_to_iso(entry) -> str:
@@ -1193,13 +1207,13 @@ def load_processed(tag: str) -> set[str]:
     index = processed_index_path(tag)
     if index.exists():
         return {
-            line.rstrip("\n")
+            _nfc(line.rstrip("\n"))
             for line in index.read_text(encoding="utf-8").splitlines()
             if line.strip()
         }
 
     transcript_dir = Path(f"./transcripts/{tag}")
-    stems = sorted({p.stem for p in transcript_dir.glob("*.md")} if transcript_dir.is_dir() else set())
+    stems = sorted({_nfc(p.stem) for p in transcript_dir.glob("*.md")} if transcript_dir.is_dir() else set())
     if stems:
         transcript_dir.mkdir(parents=True, exist_ok=True)
         index.write_text("\n".join(stems) + "\n", encoding="utf-8")
@@ -1213,10 +1227,11 @@ def record_processed(tag: str, stem: str) -> None:
     Idempotent: a no-op if the stem is already indexed, so re-transcribing via
     --reprocess doesn't leave duplicate lines.
     """
+    stem = _nfc(stem)
     index = processed_index_path(tag)
     index.parent.mkdir(parents=True, exist_ok=True)
     if index.exists():
-        existing = {ln.strip() for ln in index.read_text(encoding="utf-8").splitlines() if ln.strip()}
+        existing = {_nfc(ln.strip()) for ln in index.read_text(encoding="utf-8").splitlines() if ln.strip()}
         if stem in existing:
             return
     with open(index, "a", encoding="utf-8") as f:
@@ -1486,14 +1501,14 @@ def run_download(feed, args):
     out_dir = Path(args.out) if args.out else default_dir("downloads", args.feed)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    existing_mp3s = {p.stem for p in out_dir.glob("*.mp3")}
+    existing_mp3s = {_nfc(p.stem) for p in out_dir.glob("*.mp3")}
 
     if args.feed:
         existing_transcripts = load_processed(args.feed)
     else:
         # No --feed → fall back to glob-based detection.
         transcript_dir = Path(args.transcript_dir) if args.transcript_dir else default_dir("transcripts", args.feed)
-        existing_transcripts = {p.stem for p in transcript_dir.glob("*.md")} if transcript_dir.is_dir() else set()
+        existing_transcripts = {_nfc(p.stem) for p in transcript_dir.glob("*.md")} if transcript_dir.is_dir() else set()
     skip = existing_mp3s | existing_transcripts
 
     print(f"Output dir: {out_dir} ({len(existing_mp3s)} existing mp3(s), {len(existing_transcripts)} already transcribed)\n")
@@ -1550,7 +1565,7 @@ def run_fetch(feed, args):
     if args.feed:
         existing = load_processed(args.feed)
     else:
-        existing = {p.stem for p in out_dir.glob("*.md")}
+        existing = {_nfc(p.stem) for p in out_dir.glob("*.md")}
     print(f"Output dir: {out_dir} ({len(existing)} existing transcript(s))\n")
 
     limit = effective_limit(args)
@@ -1705,7 +1720,7 @@ def run_status(args):
         # Orphan mp3s: present locally but no .processed entry → needs transcribing.
         orphan = 0
         if mp3_dir.is_dir():
-            orphan = sum(1 for p in mp3_dir.glob("*.mp3") if p.stem not in processed)
+            orphan = sum(1 for p in mp3_dir.glob("*.mp3") if _nfc(p.stem) not in processed)
 
         # Headerless: .md without YAML frontmatter (i.e. metadata never landed).
         transcript_dir = Path(f"./transcripts/{tag}")
@@ -1969,7 +1984,7 @@ def run_backfill_headers(args):
         for md_path in md_files:
             existing = md_path.read_text(encoding="utf-8")
             has_frontmatter = existing.startswith("---\n")
-            meta = meta_by_stem.get(md_path.stem)
+            meta = meta_by_stem.get(_nfc(md_path.stem))
             if not meta:
                 if not has_frontmatter:
                     unmatched += 1
@@ -2071,7 +2086,7 @@ def _run_feed_via_subprocess(args, mp3_dir: Path, out_dir: Path,
     def is_done(stem: str) -> bool:
         if diarize_only:
             return (out_dir / ".diarize" / f"{stem}.json").exists()
-        return stem in load_processed(tag)
+        return _nfc(stem) in load_processed(tag)
 
     # Snapshot the actually-pending set now and respect limit_remaining upfront.
     # Concurrency requires explicit per-worker --only assignment; doing it here
@@ -2191,25 +2206,25 @@ def run_transcribe(args):
         elif feed_cfg:
             existing = load_processed(tag)
         else:
-            existing = {p.stem for p in out_dir.glob("*.md")} if out_dir.is_dir() else set()
+            existing = {_nfc(p.stem) for p in out_dir.glob("*.md")} if out_dir.is_dir() else set()
         # --reprocess forces episodes that are already in `existing` back into
         # scope: a specific stem if given, else the whole feed. Diarize-only
         # mode is left alone (its done-signal is the cache, not .processed).
         reprocess = getattr(args, "reprocess", None)
         if reprocess is not None and not diarize_only:
             if reprocess != "__ALL__":
-                to_process = [f for f in mp3s if f.stem == reprocess]
+                to_process = [f for f in mp3s if _nfc(f.stem) == _nfc(reprocess)]
                 if not to_process:
                     print(f"  ⚠ --reprocess: no mp3 in {mp3_dir} matches stem '{reprocess}'")
             else:
                 to_process = list(mp3s)
         else:
-            to_process = [f for f in mp3s if f.stem not in existing]
+            to_process = [f for f in mp3s if _nfc(f.stem) not in existing]
         # --only <stem> narrows this run to a single episode by stem name.
         # Used by --subprocess-per-episode to dispatch specific episodes
         # from a parent's parallel queue without races.
         if getattr(args, "only", None):
-            to_process = [f for f in to_process if f.stem == args.only]
+            to_process = [f for f in to_process if _nfc(f.stem) == _nfc(args.only)]
         plan.append((mp3_dir, out_dir, to_process))
         pair_diarize[tag] = should_diarize(args, feed_cfg)
         pair_batch[tag] = int(feed_cfg.get("whisper_batch_size", 12))
