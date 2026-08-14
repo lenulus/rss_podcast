@@ -172,6 +172,8 @@ def _url_keys(url: str) -> tuple[str, str]:
 
     full_key  — scheme-insensitive 'host/path' with any trailing slash stripped,
                 so 'https://x/a', 'http://x/a' and '…/a/' collapse together.
+                Falls back to 'host?query' when the path is empty, for
+                query-string permalinks (see below).
     slug_key  — 'host|<final-path-segment>'. This stays stable when a site
                 restructures its path *prefix* — e.g. OpenRouter moving
                 '/announcements/x' → '/blog/announcements/x/', which once made
@@ -185,7 +187,14 @@ def _url_keys(url: str) -> tuple[str, str]:
     from urllib.parse import urlsplit
     s = urlsplit(url.strip())
     host = (s.netloc or "").lower()
-    full = f"{host}{s.path.rstrip('/')}"
+    path = s.path.rstrip("/")
+    # Query-string permalinks put their whole identity in the query: WordPress
+    # '?p=<id>' guids (8 of the 50 items in Stratechery's Passport feed) have an
+    # empty path, so without this every one of them keys to the bare host — the
+    # first gets ingested and the other seven look permanently "seen". Sources
+    # with a real path — every other one here — still drop the query, so
+    # tracking params can't fork the key.
+    full = f"{host}{path}" if path else f"{host}?{s.query}"
     return full, f"{host}|{slug_from_url(url)}"
 
 
@@ -291,6 +300,86 @@ def discover_rss(source_cfg: dict) -> list[tuple[str, str, str]]:
         out.append((link, published_iso, e.get("title", "").strip()))
     if skipped:
         print(f"    ↷ {skipped} entries skipped (older than since={source_cfg.get('since')!r})")
+    return out
+
+
+CONTENT_ENCODED = "content_encoded"
+
+
+def discover_rss_inline(source_cfg: dict) -> list[tuple]:
+    """Like discover_rss, but keeps each entry's full body from the feed itself.
+
+    For feeds that ship the complete article in <content:encoded> and whose
+    per-article pages are NOT fetchable — Stratechery's Passport feed being the
+    case this exists for. There, fetching the page gets you the paywalled
+    ~490-char teaser, while the feed carries the whole 15–40k-char article. So
+    the body travels in the payload and no per-article HTTP request happens.
+
+    Two entry-level quirks this normalizes, both Passport-specific but neither
+    unreasonable to hit elsewhere:
+
+    <link> is single-use and credential-bearing: 'https://stratechery.com/
+    ?access_token=<JWT>&p=19673', where the JWT is regenerated on every feed
+    fetch and expires in 30 days. Keying dedup off it would make all 50 items
+    look new on every poll, and archiving it would write a soon-dead link
+    (carrying the subscriber's token) into every file. <guid isPermaLink="true">
+    is the stable canonical URL, so that's what's used for dedup, filename, and
+    the frontmatter `url` — link is the fallback only if guid is missing.
+
+    The token also appears inline in the body, in two "add to your podcast
+    player" boilerplate blocks. `secret` (the feed's own token) drops any line
+    containing it, which removes both and guarantees the credential never
+    reaches ./news/ or the backup mirror.
+    """
+    url = source_cfg["url"]
+    feed = feedparser.parse(url)
+    if feed.bozo and not feed.entries:
+        raise RuntimeError(f"RSS parse failed: {feed.bozo_exception}")
+    cutoff = parse_since(source_cfg.get("since"))
+    # The trailing path segment of the feed URL is the subscriber token.
+    secret = url.rstrip("/").rsplit("/", 1)[-1]
+    out: list[tuple] = []
+    skipped = 0
+    empty = 0
+    for e in feed.entries:
+        # guid first (stable canonical permalink), link second.
+        link = (e.get("id") or "").strip() or (e.get("link") or "").strip()
+        if not link:
+            continue
+        link = link.split("#", 1)[0]
+        html = ""
+        for c in (e.get("content") or []):
+            if c.get("value"):
+                html = c["value"]
+                break
+        if not html:
+            html = e.get("summary", "") or ""
+        if not html.strip():
+            empty += 1
+            continue
+        published_iso = ""
+        for key in ("published_parsed", "updated_parsed"):
+            t = e.get(key)
+            if t:
+                published_iso = datetime(*t[:6], tzinfo=timezone.utc).isoformat()
+                break
+        if cutoff and published_iso:
+            pub_dt = _parse_iso_datetime(published_iso)
+            if pub_dt and pub_dt < cutoff:
+                skipped += 1
+                continue
+        title = (e.get("title") or "").strip()
+        out.append((link, published_iso, title, {
+            "kind": CONTENT_ENCODED,
+            "html": html,
+            "title": title,
+            "author": (e.get("author") or "").strip(),
+            "secret": secret,
+        }))
+    if skipped:
+        print(f"    ↷ {skipped} entries skipped (older than since={source_cfg.get('since')!r})")
+    if empty:
+        print(f"    ↷ {empty} entries skipped (no inline content)")
     return out
 
 
@@ -402,13 +491,16 @@ def discover(source_cfg: dict) -> list[tuple]:
     """Unified discovery dispatch.
 
     Returns [(url, published_iso, title, payload), …] where `payload` is None
-    for RSS/sitemap sources (body fetched later via trafilatura) and a
-    normalized dict for hf-daily-papers (body already in hand from the JSON
-    API, no per-article fetch needed).
+    for RSS/sitemap sources (body fetched later via trafilatura) and a dict for
+    the two source types that already hold the body at discovery time and skip
+    the per-article fetch: hf-daily-papers (normalized JSON from the API) and
+    rss-inline (tagged with kind=CONTENT_ENCODED; body from <content:encoded>).
     """
     t = source_cfg.get("type", "").lower()
     if t == "rss":
         return [(u, d, ti, None) for u, d, ti in discover_rss(source_cfg)]
+    if t == "rss-inline":
+        return discover_rss_inline(source_cfg)
     if t == "sitemap":
         return [(u, d, ti, None) for u, d, ti in discover_sitemap(source_cfg)]
     if t == "hf-daily-papers":
@@ -773,6 +865,61 @@ def _strip_after(body: str, marker: str) -> str:
     return body[: m.start()].rstrip() if m else body
 
 
+def _strip_secret_lines(body: str, secret: str) -> str:
+    """Drop every line containing `secret` (a feed's subscriber token).
+
+    Credential-bearing feeds tend to sprinkle the token through the body as
+    well as the entry links — Stratechery's Passport feed wraps each article in
+    two "add to your podcast player" blocks whose every href carries it. Those
+    lines are pure boilerplate, so dropping them removes the chrome and
+    guarantees the token never lands in ./news/ or on the backup mirror.
+    """
+    if not secret:
+        return body
+    kept = [ln for ln in body.splitlines() if secret not in ln]
+    return re.sub(r"\n{3,}", "\n\n", "\n".join(kept)).strip()
+
+
+def extract_inline(payload: dict, strip_after: str = "") -> Optional[tuple[str, dict]]:
+    """(markdown_body, metadata_dict) from an rss-inline payload — no HTTP.
+
+    Same trafilatura settings as fetch_and_extract so inline sources render
+    identically to fetched ones; the html2txt fallback applies here too, since
+    <content:encoded> is sometimes a bare fragment that trips the same
+    content-density heuristic.
+    """
+    html = payload.get("html") or ""
+    try:
+        body = trafilatura.extract(
+            html,
+            output_format="markdown",
+            include_links=True,
+            include_formatting=True,
+            favor_recall=True,
+        )
+    except Exception as e:
+        print(f"    ✗ extract failed: {e}")
+        return None
+    if not body or not body.strip():
+        fallback = (trafilatura.html2txt(html) or "").strip()
+        if len(fallback) >= HTML2TXT_FALLBACK_MIN_CHARS:
+            print(f"    ⚠ extract empty — html2txt fallback ({len(fallback)} chars, low fidelity)")
+            body = fallback
+        else:
+            print(f"    ✗ inline content extracted to an empty body")
+            return None
+    body = _strip_secret_lines(_strip_after(body, strip_after), payload.get("secret", ""))
+    if not body:
+        print(f"    ✗ body empty after stripping")
+        return None
+    return body, {
+        "title": payload.get("title", ""),
+        "author": payload.get("author", ""),
+        "date": "",
+        "sitename": "",
+    }
+
+
 def fetch_and_extract(url: str, sid: Optional[str] = None,
                       fetcher: str = "", strip_after: str = "") -> Optional[tuple[str, dict]]:
     """Return (markdown_body, metadata_dict) or None on failure.
@@ -930,8 +1077,15 @@ def date_from_slug(url: str, source_cfg: dict) -> str:
         return ""
 
 
-def slug_from_url(url: str) -> str:
-    """Last path segment, lowercased, safe-chars-only, length-capped."""
+def slug_from_url(url: str, fallback: str = "") -> str:
+    """Last path segment, lowercased, safe-chars-only, length-capped.
+
+    `fallback` (typically the entry title) is used when the URL has no usable
+    path segment at all, ahead of the sha1 last resort — query-string
+    permalinks like 'stratechery.com/?p=19673' hit this. Callers that key
+    dedup off this must leave it unset: the sha1 is derived from the URL and
+    is therefore stable, whereas a title can be edited after publication.
+    """
     tail = url.rstrip("/").rsplit("/", 1)[-1] or "index"
     tail = tail.split("?", 1)[0].split("#", 1)[0]
     # Strip a single trailing file extension (.md / .html / .htm / .json …).
@@ -942,6 +1096,8 @@ def slug_from_url(url: str) -> str:
     # would look identical). Real extensions (.md/.html/.json) start with a letter.
     tail = re.sub(r"\.[a-z][a-z0-9]{0,4}$", "", tail, flags=re.IGNORECASE)
     safe = re.sub(r"[^a-z0-9-]+", "-", tail.lower()).strip("-")
+    if not safe and fallback:
+        safe = _slug_from_text(fallback)
     if not safe:
         safe = hashlib.sha1(url.encode()).hexdigest()[:10]
     return safe[:80]
@@ -954,15 +1110,21 @@ def escape_yaml(s: str) -> str:
 # ── Render ────────────────────────────────────────────────────────────────────
 
 def render_article(source: str, url: str, body: str, meta: dict,
-                   discovery_date: str, *, backfilled: bool = False) -> tuple[Path, str, str]:
+                   discovery_date: str, *, backfilled: bool = False,
+                   slug_hint: str = "") -> tuple[Path, str, str]:
     """Return (out_path, content, published_iso). Caller writes the file.
 
     backfilled=True marks the article as a manual one-off ingest (adds a
     `backfilled` tag) so it is distinguishable from scheduled poller output.
+
+    slug_hint is used for the filename only when the URL has no usable path
+    slug — query-string permalinks like 'stratechery.com/?p=19673' otherwise
+    fall through to slug_from_url's sha1 fallback and produce filenames like
+    '2026-08-11 - 3f2a9c1b0d.md'. Dedup still keys off the URL either way.
     """
     fetched_iso = datetime.now(timezone.utc).isoformat()
     date_prefix, published_iso = normalize_date(meta.get("date", ""), discovery_date)
-    slug = slug_from_url(url)
+    slug = slug_from_url(url, fallback=slug_hint)
     filename = f"{date_prefix} - {slug}.md"
     out_path = Path(f"./news/{source}/{filename}")
 
@@ -1238,7 +1400,28 @@ def process_source(source: str, source_cfg: dict, defaults: dict,
     promoted_to_failed = 0
     for i, (url, discovery_date, title_hint, payload) in enumerate(pending, 1):
         print(f"\n  [{i}/{len(pending)}] {url}")
-        if payload is not None:
+        if payload is not None and payload.get("kind") == CONTENT_ENCODED:
+            # rss-inline path: the feed already carried the whole article, so
+            # there is no per-article fetch. `url` here is the guid permalink,
+            # which is what lands in the frontmatter and the dedup ledger.
+            extracted = extract_inline(payload, strip_after=source_cfg.get("strip_after", ""))
+            if not extracted:
+                attempts[url] = attempts.get(url, 0) + 1
+                if attempts[url] >= max_failures:
+                    record_failed(source, url)
+                    attempts.pop(url, None)
+                    promoted_to_failed += 1
+                    print(f"    ✗ giving up after {max_failures} attempts — moved to .failed")
+                else:
+                    remaining = max_failures - attempts[url]
+                    print(f"    ↻ attempt {attempts[url]}/{max_failures} — will retry on future runs ({remaining} left)")
+                continue
+            attempts.pop(url, None)
+            body, meta = extracted
+            out_path, content, published = render_article(
+                source, url, body, meta, discovery_date, slug_hint=title_hint)
+            body_len = len(body)
+        elif payload is not None:
             # HF paper path: payload carries the full normalized JSON already;
             # no per-article fetch + trafilatura step. Optionally pull the full
             # paper text from arxiv's HTML render (best-effort) when configured.
@@ -1286,7 +1469,11 @@ def process_source(source: str, source_cfg: dict, defaults: dict,
         record_processed(source, url)
         written += 1
         print(f"    ✓ wrote {out_path.name} (published={published or '?'}, {body_len} chars)")
-        time.sleep(delay)
+        # The politeness delay pays for a per-article HTTP request. rss-inline
+        # makes none — the whole batch came from the single feed fetch — so
+        # sleeping there would just add 75s to a 50-article backfill.
+        if payload is None or payload.get("kind") != CONTENT_ENCODED:
+            time.sleep(delay)
     save_attempts(source, attempts)
     suffix = f", {promoted_to_failed} moved to .failed" if promoted_to_failed else ""
     print(f"\n  [{source}] wrote {written} new article(s){suffix}.")
