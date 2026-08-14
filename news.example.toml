@@ -114,6 +114,16 @@ type = "sitemap"
 sitemap_url = "https://www.anthropic.com/sitemap.xml"
 path_filter = "/news/"
 
+[sources.anthropic-research]
+type = "sitemap"
+sitemap_url = "https://www.anthropic.com/sitemap.xml"
+path_filter = "/research/"
+
+[sources.anthropic-engineering]
+type = "sitemap"
+sitemap_url = "https://www.anthropic.com/sitemap.xml"
+path_filter = "/engineering/"
+
 # /sitemap.xml 404s; robots.txt points at /sitemap-index.xml. The host-qualified
 # path_filter keeps the English /news/ posts and drops localized /fr/news/, /it/news/.
 [sources.mistral]
@@ -208,6 +218,47 @@ type = "sitemap"
 sitemap_url = "https://www.aisi.gov.uk/sitemap.xml"
 path_filter = "/blog/"
 
+# DeepSeek — no blog and no feed. Their only first-party English channel is the
+# release-notes section of the API docs: ~15 /news/ pages, one per model launch
+# (V4 Preview, V3.2, V3.1, R1, V3 …), so a handful per year, not per week.
+#
+# These are Docusaurus pages whose sidebar lists *every* release with its date,
+# so trafilatura reliably picks the wrong one — before `date_from_slug` the V4
+# Preview post filed itself under 2025-09-22. The slug is the only trustworthy
+# date: `news260424` = 2026-04-24. The regex needs `m`/`d` groups and may have
+# `y` (2-digit, read as 20YY); when `y` is absent the year falls back to
+# `slug_year_fallback`, since DeepSeek's pre-2025 slugs are bare MMDD
+# (`news1226` = the 2024-12-26 V3 launch). A slug that matches the shape but
+# isn't a real date is ignored, as is any source that omits `date_from_slug`.
+#
+# deepseek.com and the GitHub org are both dead ends: the former is a JS app
+# with no article routes, the latter has effectively no releases (weights ship
+# to Hugging Face instead).
+[sources.deepseek]
+type = "sitemap"
+sitemap_url = "https://api-docs.deepseek.com/sitemap.xml"
+path_filter = "/news/"
+date_from_slug = '^news(?P<y>\d{2})?(?P<m>\d{2})(?P<d>\d{2})$'
+slug_year_fallback = 2024
+
+# Artificial Analysis — independent model benchmarking (Intelligence Index,
+# AA-Briefcase, Coding Index, per-provider throughput/latency). No feed of any
+# kind: /rss.xml, /feed.xml and /feed all 404, and /changelog ships no
+# <link rel="alternate">. /changelog is one server-rendered page; its
+# "New article published" rows point at /articles/{slug}, and those slugs are
+# in sitemap.xml with a dated <lastmod>, so a sitemap source captures exactly
+# the prose posts. The changelog's other rows (new eval scores, "X performance
+# results now available") are leaderboard data points with no page behind them
+# — reaching those would mean diffing the changelog HTML on each run.
+#
+# Note the sitemap is ~2 MB / ~10.4k URLs (~9.7k are /models/* pages), all
+# fetched and scanned before path_filter cuts it to ~77 articles. Fine for a
+# once-daily poll; reconsider if the cadence increases.
+[sources.artificialanalysis]
+type = "sitemap"
+sitemap_url = "https://artificialanalysis.ai/sitemap.xml"
+path_filter = "/articles/"
+
 # ── Hugging Face Daily Papers ─────────────────────────────────────────────────
 # Curated AI/ML research papers via JSON API. Daily volume is ~10–20 new papers;
 # filter with min_upvotes + top_n to keep the wiki signal-to-noise high.
@@ -231,15 +282,19 @@ fetch_fulltext = true             # also pull each paper's full text from arxiv'
 #
 # Trafilatura is skipped entirely — the publisher's own markdown is canonical.
 #
-# Example: antigravity.google. Bundle URL rotates on every deploy, so the
-# bundle_regex matches the hash-suffixed filename pattern, not a literal URL.
-[sources.antigravity]
-type = "static-markdown-spa"
-base_url = "https://antigravity.google"
-# Optional. Page on base_url whose HTML contains a <script src=…> reference
-# matched by bundle_regex. Defaults to "/" (the homepage), which is right
-# for most SPAs.
-# bundle_path = "/"
-bundle_regex = '<script[^>]+src="(main-[A-Z0-9]+\.js)"'
-slug_regex = 'link:"/blog/([a-z0-9-]+)"'
-article_url_template = "/assets/blog-posts/{slug}.md"
+# Config shape (for a site that still ships this way):
+#   type = "static-markdown-spa"
+#   base_url = "https://example.com"
+#   # bundle_path = "/"          # optional; page whose HTML references the bundle
+#   bundle_regex = '<script[^>]+src="(main-[A-Z0-9]+\.js)"'  # hash rotates per deploy
+#   slug_regex = 'link:"/blog/([a-z0-9-]+)"'
+#   article_url_template = "/assets/blog-posts/{slug}.md"
+#
+# NOTE: antigravity.google used to be the canonical example here. In 2026-07 it
+# was rebuilt as an Astro static site (server-rendered /blog/{slug} HTML + a real
+# sitemap.xml), so it's now configured as an ordinary `sitemap` source instead:
+#
+#   [sources.antigravity]
+#   type = "sitemap"
+#   sitemap_url = "https://antigravity.google/sitemap.xml"
+#   path_filter = "/blog/"

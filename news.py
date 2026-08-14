@@ -758,8 +758,23 @@ def discover_hf_papers(source_cfg: dict) -> list[tuple]:
 
 # ── Article fetch + extract ───────────────────────────────────────────────────
 
+def _strip_after(body: str, marker: str) -> str:
+    """Cut `body` at the first line matching `marker` (regex, case-insensitive).
+
+    For sites that append fixed boilerplate below the article — Stratechery
+    renders its full subscription FAQ under every paywalled Daily Update, so
+    a ~490-char preview extracts as ~4.9k, 90% of it the same FAQ repeated on
+    every post. Leaves the body untouched when the marker is absent, so free
+    posts on the same source keep their full text.
+    """
+    if not marker:
+        return body
+    m = re.search(marker, body, re.IGNORECASE)
+    return body[: m.start()].rstrip() if m else body
+
+
 def fetch_and_extract(url: str, sid: Optional[str] = None,
-                      fetcher: str = "") -> Optional[tuple[str, dict]]:
+                      fetcher: str = "", strip_after: str = "") -> Optional[tuple[str, dict]]:
     """Return (markdown_body, metadata_dict) or None on failure.
 
     Defaults to `requests.get` (not trafilatura's bundled fetcher) because:
@@ -800,6 +815,13 @@ def fetch_and_extract(url: str, sid: Optional[str] = None,
         if not r.ok:
             print(f"    ✗ HTTP {r.status_code} from {r.url}")
             return None
+        # When a server sends `text/html` with no charset (e.g. antigravity),
+        # requests defaults r.encoding to ISO-8859-1 per RFC 2616, which turns
+        # UTF-8 pages into mojibake ("It's" → "Itâs", "—" → "â"). Only sniff
+        # the real charset in that gap — leave an explicitly-declared charset
+        # untouched.
+        if "charset=" not in r.headers.get("content-type", "").lower():
+            r.encoding = r.apparent_encoding or "utf-8"
         downloaded = r.text
     if not downloaded:
         print(f"    ✗ fetch returned empty")
@@ -833,6 +855,7 @@ def fetch_and_extract(url: str, sid: Optional[str] = None,
         else:
             print(f"    ✗ extract returned empty body")
             return None
+    body = _strip_after(body, strip_after)
     meta = trafilatura.extract_metadata(downloaded)
     meta_dict = {
         "title": (meta.title if meta and meta.title else "").strip(),
@@ -871,6 +894,42 @@ def normalize_date(*candidates: str) -> tuple[str, str]:
     return "0000-00-00", ""
 
 
+def date_from_slug(url: str, source_cfg: dict) -> str:
+    """Derive a YYYY-MM-DD date from a date-coded URL slug, or "".
+
+    Some publishers date-code the slug but expose no usable date in the page
+    itself. DeepSeek's release notes are the motivating case: every /news/
+    page is a Docusaurus doc whose sidebar lists *all* releases with their
+    dates, so trafilatura picks an arbitrary one and every article lands under
+    the wrong filename prefix. The slug (`news260424`) is the only reliable
+    signal.
+
+    `date_from_slug` is a regex matched against the slug; it must supply `m`
+    and `d` groups and may supply `y`. A 2-digit `y` is read as 20YY. When `y`
+    is absent the year comes from `slug_year_fallback` — DeepSeek's pre-2025
+    slugs are bare MMDD (`news1226` = the 2024-12-26 V3 launch).
+
+    Returns "" on any miss so the caller falls back to the normal date chain.
+    """
+    pattern = source_cfg.get("date_from_slug")
+    if not pattern:
+        return ""
+    m = re.search(pattern, slug_from_url(url))
+    if not m:
+        return ""
+    g = m.groupdict()
+    year = g.get("y") or str(source_cfg.get("slug_year_fallback") or "")
+    if not (year and g.get("m") and g.get("d")):
+        return ""
+    if len(year) == 2:
+        year = f"20{year}"
+    try:
+        return datetime(int(year), int(g["m"]), int(g["d"])).strftime("%Y-%m-%d")
+    except ValueError:
+        # Slug matched the shape but isn't a real date (e.g. month 19).
+        return ""
+
+
 def slug_from_url(url: str) -> str:
     """Last path segment, lowercased, safe-chars-only, length-capped."""
     tail = url.rstrip("/").rsplit("/", 1)[-1] or "index"
@@ -895,8 +954,12 @@ def escape_yaml(s: str) -> str:
 # ── Render ────────────────────────────────────────────────────────────────────
 
 def render_article(source: str, url: str, body: str, meta: dict,
-                   discovery_date: str) -> tuple[Path, str, str]:
-    """Return (out_path, content, published_iso). Caller writes the file."""
+                   discovery_date: str, *, backfilled: bool = False) -> tuple[Path, str, str]:
+    """Return (out_path, content, published_iso). Caller writes the file.
+
+    backfilled=True marks the article as a manual one-off ingest (adds a
+    `backfilled` tag) so it is distinguishable from scheduled poller output.
+    """
     fetched_iso = datetime.now(timezone.utc).isoformat()
     date_prefix, published_iso = normalize_date(meta.get("date", ""), discovery_date)
     slug = slug_from_url(url)
@@ -920,7 +983,7 @@ def render_article(source: str, url: str, body: str, meta: dict,
     else:
         fm_lines.append("authors: []")
     fm_lines.extend([
-        "tags: [news]",
+        "tags: [news, backfilled]" if backfilled else "tags: [news]",
         "---",
         "",
     ])
@@ -1190,7 +1253,8 @@ def process_source(source: str, source_cfg: dict, defaults: dict,
                 extracted = fetch_markdown_passthrough(url)
             else:
                 extracted = fetch_and_extract(url, sid=source_cfg.get("sid"),
-                                               fetcher=source_cfg.get("fetcher", ""))
+                                               fetcher=source_cfg.get("fetcher", ""),
+                                               strip_after=source_cfg.get("strip_after", ""))
             if not extracted:
                 # Bump the per-URL failure counter; promote to .failed at threshold.
                 attempts[url] = attempts.get(url, 0) + 1
@@ -1209,6 +1273,12 @@ def process_source(source: str, source_cfg: dict, defaults: dict,
             body, meta = extracted
             if not meta.get("title") and title_hint:
                 meta["title"] = title_hint
+            # A date-coded slug outranks trafilatura's guess: sources that set
+            # `date_from_slug` do so precisely because the page's own date
+            # markup is unreliable (see date_from_slug's docstring).
+            slug_date = date_from_slug(url, source_cfg)
+            if slug_date:
+                meta["date"] = slug_date
             out_path, content, published = render_article(source, url, body, meta, discovery_date)
             body_len = len(body)
         out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1221,6 +1291,64 @@ def process_source(source: str, source_cfg: dict, defaults: dict,
     suffix = f", {promoted_to_failed} moved to .failed" if promoted_to_failed else ""
     print(f"\n  [{source}] wrote {written} new article(s){suffix}.")
     backup_source(source, defaults, source_cfg)
+
+
+def fetch_one(url: str, slug: str, config: dict, *,
+              date: str = "", title: str = "",
+              backfilled: bool = True, check: bool = False) -> int:
+    """Manually ingest a single URL into news/<slug>/ via the normal flow.
+
+    Reuses fetch_and_extract → render_article → record_processed → backup_source
+    so the output (frontmatter, filename slug, .processed dedup key, and backup
+    mirror) is byte-identical to a polled article. The slug need NOT exist in
+    news.toml: an absent slug is treated as an ad-hoc one-off archive that
+    scheduled runs ignore, until/unless a [sources.<slug>] block is later added
+    — at which point this folder and its .processed ledger are adopted with no
+    duplicate fetch (the dedup key matches what the poller would compute).
+
+    Returns a shell-style exit code: 0 = written or already-present, 1 = fetch
+    failure. Intended to run host-side, same as --all.
+    """
+    sources = config.get("sources", {}) or {}
+    defaults = config.get("defaults", {}) or {}
+    source_cfg = sources.get(slug) or {"type": "manual"}
+
+    if url in load_processed(slug):
+        print(f"  · [{slug}] already ingested — {url}")
+        return 0
+
+    if check:
+        print(f"  [{slug}] would fetch → {url}")
+        return 0
+
+    print(f"  [{slug}] fetching → {url}")
+    if source_cfg.get("type") == "static-markdown-spa":
+        extracted = fetch_markdown_passthrough(url)
+    else:
+        extracted = fetch_and_extract(url, sid=source_cfg.get("sid"),
+                                      fetcher=source_cfg.get("fetcher", ""),
+                                      strip_after=source_cfg.get("strip_after", ""))
+    if not extracted:
+        print(f"  ✗ [{slug}] extraction failed — nothing written.")
+        return 1
+
+    body, meta = extracted
+    if title:
+        meta["title"] = title
+    if date:
+        # Authoritative for both the filename prefix and the `published` field.
+        meta["date"] = date
+    discovery_date = date or datetime.now(timezone.utc).date().isoformat()
+
+    out_path, content, published = render_article(slug, url, body, meta,
+                                                  discovery_date, backfilled=backfilled)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(content, encoding="utf-8")
+    record_processed(slug, url)
+    print(f"  ✓ [{slug}] wrote {out_path.name} "
+          f"(published={published or '?'}, {len(body)} chars)")
+    backup_source(slug, defaults, source_cfg)
+    return 0
 
 
 # ── Status ────────────────────────────────────────────────────────────────────
@@ -1253,10 +1381,26 @@ def main():
     parser.add_argument("--retry-failed", action="store_true",
                         help="Clear each targeted source's .failed list (and .attempts.json) before discovery, "
                              "so URLs previously given up on get one more shot.")
+    parser.add_argument("--fetch-one", metavar="URL", default=None,
+                        help="Manually ingest a single article URL into news/<--source>/ using the normal "
+                             "flow (frontmatter, dedup, backup). The --source slug need not exist in news.toml; "
+                             "combine with --check for a dry run.")
+    parser.add_argument("--date", default="",
+                        help="Override publish date (YYYY-MM-DD) for --fetch-one; sets the filename prefix "
+                             "and the `published` field. Defaults to today when omitted.")
+    parser.add_argument("--title", default="",
+                        help="Override the title for --fetch-one when extraction misses it.")
     args = parser.parse_args()
 
     config = load_config(Path(args.config))
     sources = config.get("sources", {}) or {}
+
+    if args.fetch_one:
+        if not args.source:
+            sys.exit("--fetch-one requires --source <slug> (the target news/<slug>/ folder).")
+        sys.exit(fetch_one(args.fetch_one, args.source, config,
+                           date=args.date, title=args.title, check=args.check))
+
     if not sources:
         sys.exit(f"No [sources.<slug>] entries found in {args.config}.")
 
