@@ -15,7 +15,9 @@ See feeds.example.toml for the config format.
 """
 
 import argparse
+import filecmp
 import gc
+import os
 import re
 import shutil
 import sys
@@ -1288,11 +1290,106 @@ def resolve_transcript_dir(tag: str, feed_cfg: dict) -> Path | None:
 
 # ── Transcript backup ─────────────────────────────────────────────────────────
 
+# Backup targets are often removable volumes with coarse timestamp resolution:
+# exFAT stores mtimes to 10ms, FAT32 to 2s. shutil.copy2 hands the source mtime
+# to the filesystem, which truncates it — so a fresh copy reads back *older*
+# than its source and an `mtime >=` check re-copies the whole corpus forever.
+# Treat mtime as a hint good to this tolerance, never as ground truth.
+_BACKUP_MTIME_TOL = 2.0
+
+# If the volume goes away mid-sync every remaining file fails the same way.
+# Bail after this many consecutive errors rather than printing hundreds.
+_BACKUP_MAX_CONSECUTIVE_ERRORS = 5
+
+
+def _copy_atomic(src: Path, dest: Path) -> None:
+    """Copy src→dest so an interrupted run can't leave a truncated backup.
+
+    Writes to a sibling temp file, flushes it to the platter, then renames over
+    the target. A yanked USB cable or a full disk leaves the old backup intact
+    and a stray .tmp file, not a half-written transcript.
+    """
+    tmp = dest.with_name(f".{dest.name}.tmp")
+    try:
+        shutil.copyfile(src, tmp)
+        with open(tmp, "rb") as fh:
+            os.fsync(fh.fileno())
+        # Verify before publishing: exFAT can silently short-write when full.
+        if tmp.stat().st_size != src.stat().st_size:
+            raise OSError(f"short write ({tmp.stat().st_size} of {src.stat().st_size} bytes)")
+        os.replace(tmp, dest)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
+    # Best-effort mtime carry-over; harmless if the filesystem rounds it.
+    try:
+        shutil.copystat(src, dest)
+    except OSError:
+        pass
+
+
+def _needs_sync(src: Path, dest: Path) -> bool:
+    """Decide whether dest is a stale copy of src, without trusting mtime.
+
+    Size is authoritative when it differs. When sizes match, a backup that
+    looks at least as fresh as its source (within filesystem rounding) is
+    taken as current; anything else is byte-compared, so a rewritten header
+    that happens to preserve the length is still caught.
+    """
+    src_st, dest_st = src.stat(), dest.stat()
+    if src_st.st_size != dest_st.st_size:
+        return True
+    if dest_st.st_mtime + _BACKUP_MTIME_TOL >= src_st.st_mtime:
+        return False
+    return not filecmp.cmp(src, dest, shallow=False)
+
+
+def _sync_files(files: list[Path], dest_dir: Path, tag: str, label: str) -> None:
+    """Mirror `files` into dest_dir, reporting new/updated counts once."""
+    copied = 0
+    refreshed = 0
+    errors = 0
+    consecutive = 0
+    for f in files:
+        dest = dest_dir / f.name
+        try:
+            existed = dest.exists()
+            if existed and not _needs_sync(f, dest):
+                consecutive = 0
+                continue
+            _copy_atomic(f, dest)
+            if existed:
+                refreshed += 1
+            else:
+                copied += 1
+            consecutive = 0
+        except OSError as e:
+            errors += 1
+            consecutive += 1
+            print(f"  ✗ [{tag}] {label} backup failed for {f.name}: {e}")
+            if consecutive >= _BACKUP_MAX_CONSECUTIVE_ERRORS:
+                remaining = len(files) - files.index(f) - 1
+                print(f"  ⚠ [{tag}] {label} backup aborted after {consecutive} "
+                      f"consecutive failures — {remaining} file(s) not attempted. "
+                      f"Is {dest_dir} still mounted?")
+                break
+
+    if copied or refreshed:
+        parts = []
+        if copied:
+            parts.append(f"{copied} new")
+        if refreshed:
+            parts.append(f"{refreshed} updated")
+        print(f"  [{tag}] Backed up {' + '.join(parts)} {label}(s) → {dest_dir}")
+    if errors:
+        print(f"  ⚠ [{tag}] {errors} {label}(s) failed to back up.")
+
+
 def backup_feed_transcripts(tag: str, feed_cfg: dict) -> None:
     """Sync ./transcripts/<tag>/*.md to the feed's text dir if configured.
 
-    Idempotent: skips files already present at the target. Never deletes from
-    the local source — transcripts stay locally for grep/wiki work.
+    Idempotent: only files whose content actually differs are rewritten. Never
+    deletes from the local source — transcripts stay locally for grep/wiki work.
     """
     src = Path(f"./transcripts/{tag}")
     if not src.is_dir():
@@ -1305,34 +1402,7 @@ def backup_feed_transcripts(tag: str, feed_cfg: dict) -> None:
     if text_dir is None:
         return
 
-    copied = 0
-    refreshed = 0
-    for md in md_files:
-        dest = text_dir / md.name
-        if dest.exists():
-            # Skip only if the backup is at least as fresh as the local file.
-            # shutil.copy2 preserves mtime, so post-copy the two match exactly.
-            if dest.stat().st_mtime >= md.stat().st_mtime:
-                continue
-            try:
-                shutil.copy2(md, dest)
-                refreshed += 1
-            except OSError as e:
-                print(f"  ✗ [{tag}] transcript refresh failed for {md.name}: {e}")
-            continue
-        try:
-            shutil.copy2(md, dest)
-            copied += 1
-        except OSError as e:
-            print(f"  ✗ [{tag}] transcript backup failed for {md.name}: {e}")
-
-    if copied or refreshed:
-        parts = []
-        if copied:
-            parts.append(f"{copied} new")
-        if refreshed:
-            parts.append(f"{refreshed} updated")
-        print(f"  [{tag}] Backed up {' + '.join(parts)} transcript(s) → {text_dir}")
+    _sync_files(md_files, text_dir, tag, "transcript")
 
 
 def backup_feed_diarizations(tag: str, feed_cfg: dict) -> None:
@@ -1342,7 +1412,7 @@ def backup_feed_diarizations(tag: str, feed_cfg: dict) -> None:
     expensive to regenerate — a full pyannote pass over a 200-hour backlog
     is hours of compute. Backing it up next to the transcripts means a
     fresh clone or disaster-recovery scenario doesn't force a re-diarize.
-    Idempotent and mtime-aware, same shape as backup_feed_transcripts.
+    Idempotent and content-aware, same shape as backup_feed_transcripts.
     """
     src = Path(f"./transcripts/{tag}/.diarize")
     if not src.is_dir():
@@ -1362,32 +1432,7 @@ def backup_feed_diarizations(tag: str, feed_cfg: dict) -> None:
         print(f"  ⚠ [{tag}] cannot create diarize backup dir {dest_dir}: {e} — skipping.")
         return
 
-    copied = 0
-    refreshed = 0
-    for j in json_files:
-        dest = dest_dir / j.name
-        if dest.exists():
-            if dest.stat().st_mtime >= j.stat().st_mtime:
-                continue
-            try:
-                shutil.copy2(j, dest)
-                refreshed += 1
-            except OSError as e:
-                print(f"  ✗ [{tag}] diarize cache refresh failed for {j.name}: {e}")
-            continue
-        try:
-            shutil.copy2(j, dest)
-            copied += 1
-        except OSError as e:
-            print(f"  ✗ [{tag}] diarize cache backup failed for {j.name}: {e}")
-
-    if copied or refreshed:
-        parts = []
-        if copied:
-            parts.append(f"{copied} new")
-        if refreshed:
-            parts.append(f"{refreshed} updated")
-        print(f"  [{tag}] Backed up {' + '.join(parts)} diarize cache(s) → {dest_dir}")
+    _sync_files(json_files, dest_dir, tag, "diarize cache")
 
 
 # ── Eviction ──────────────────────────────────────────────────────────────────
