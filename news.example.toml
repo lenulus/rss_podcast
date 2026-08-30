@@ -109,15 +109,27 @@ url = "https://blogs.nvidia.com/blog/category/generative-ai/feed/"
 
 # ── Sources with no RSS — discovery via sitemap.xml ──────────────────────────
 
+# www.anthropic.com is a Next.js front-end over Sanity, and every /news/ and
+# /research/ page embeds siteSettings._createdAt (2023-11-03T16:49:36Z — when
+# the CMS site-settings doc was created) in its flight payload. trafilatura
+# takes that first date-shaped string, so every post landed under a single
+# 2023-11-03 filename prefix. `date_regex` is matched against the raw HTML
+# (case-insensitive, DOTALL) and supplies the date in a named `date` group or
+# in group 1; it accepts ISO or a human "Aug 25, 2026". It overrides
+# trafilatura only on a hit, so a template change degrades to the old
+# behaviour rather than to no date at all. /engineering/ uses a different
+# template that trafilatura reads correctly, so it deliberately has none.
 [sources.anthropic]
 type = "sitemap"
 sitemap_url = "https://www.anthropic.com/sitemap.xml"
 path_filter = "/news/"
+date_regex = '''PostDetail-module[^"]*__title"[^>]*>.*?<div class="body-3 agate">(?P<date>[A-Z][a-z]{2} \d{1,2}, \d{4})</div>'''
 
 [sources.anthropic-research]
 type = "sitemap"
 sitemap_url = "https://www.anthropic.com/sitemap.xml"
 path_filter = "/research/"
+date_regex = '''PostDetail-module[^"]*__title"[^>]*>.*?<div class="body-3 agate">(?P<date>[A-Z][a-z]{2} \d{1,2}, \d{4})</div>'''
 
 [sources.anthropic-engineering]
 type = "sitemap"

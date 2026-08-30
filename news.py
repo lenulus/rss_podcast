@@ -11,6 +11,8 @@ Discovery is pluggable per source: RSS feeds via feedparser, sitemap.xml
 via simple regex parsing. Body extraction is uniform: trafilatura pulls
 the main article content as markdown and the canonical publish date
 from <meta> tags, falling back to the sitemap's <lastmod> when needed.
+Sources whose date trafilatura reads wrong override it with a per-source
+`date_regex` (see date_from_html) or `date_from_slug`.
 """
 from __future__ import annotations
 
@@ -921,7 +923,8 @@ def extract_inline(payload: dict, strip_after: str = "") -> Optional[tuple[str, 
 
 
 def fetch_and_extract(url: str, sid: Optional[str] = None,
-                      fetcher: str = "", strip_after: str = "") -> Optional[tuple[str, dict]]:
+                      fetcher: str = "", strip_after: str = "",
+                      date_regex: str = "") -> Optional[tuple[str, dict]]:
     """Return (markdown_body, metadata_dict) or None on failure.
 
     Defaults to `requests.get` (not trafilatura's bundled fetcher) because:
@@ -1010,6 +1013,13 @@ def fetch_and_extract(url: str, sid: Optional[str] = None,
         "date": (meta.date if meta and meta.date else "").strip(),
         "sitename": (meta.sitename if meta and meta.sitename else "").strip(),
     }
+    # A source-supplied `date_regex` outranks trafilatura's guess: sources set
+    # it precisely because trafilatura reads the wrong date off the page (see
+    # date_from_html). Only override on a hit, so a template change degrades to
+    # the old behaviour rather than to no date at all.
+    html_date = date_from_html(downloaded, date_regex)
+    if html_date:
+        meta_dict["date"] = html_date
     return body, meta_dict
 
 
@@ -1039,6 +1049,66 @@ def normalize_date(*candidates: str) -> tuple[str, str]:
         if m:
             return m.group(1), m.group(1)
     return "0000-00-00", ""
+
+
+_MONTHS = {m: i for i, m in enumerate(
+    ["jan", "feb", "mar", "apr", "may", "jun",
+     "jul", "aug", "sep", "oct", "nov", "dec"], start=1)}
+
+_LOOSE_DATE_RE = re.compile(
+    r"([A-Za-z]{3,9})\.?\s+(\d{1,2}),?\s+(\d{4})")
+
+
+def _parse_loose_date(raw: str) -> str:
+    """Return YYYY-MM-DD from an ISO date or a 'Aug 25, 2026' style string, or "".
+
+    normalize_date already handles ISO-8601; this additionally reads the
+    human-readable form that some templates render as the only trustworthy
+    date on the page (see `date_regex`).
+    """
+    raw = (raw or "").strip()
+    if not raw:
+        return ""
+    m = _DATE_PREFIX_RE.match(raw)
+    if m:
+        return m.group(1)
+    m = _LOOSE_DATE_RE.search(raw)
+    if not m:
+        return ""
+    month = _MONTHS.get(m.group(1)[:3].lower())
+    if not month:
+        return ""
+    try:
+        return datetime(int(m.group(3)), month, int(m.group(2))).strftime("%Y-%m-%d")
+    except ValueError:
+        return ""
+
+
+def date_from_html(html: str, pattern: str) -> str:
+    """Derive YYYY-MM-DD by matching `pattern` against the raw page HTML, or "".
+
+    A counterpart to `date_from_slug` for sites whose date is present in the
+    markup but which trafilatura reads wrong. Anthropic is the motivating
+    case: www.anthropic.com is a Next.js front-end over Sanity, and every
+    /news/ and /research/ page embeds `siteSettings._createdAt` —
+    2023-11-03T16:49:36Z, the date the CMS *site settings document* was
+    created — in its flight payload. trafilatura takes that first date-shaped
+    string and stamps it on every article, so 153 posts spanning 2024-2026
+    landed under a single 2023-11-03 filename prefix. The real date is the
+    `<div class="body-3 agate">` that follows the post title.
+
+    The pattern must supply the date in a named `date` group or in group 1.
+    Matched case-insensitively with DOTALL so a pattern can span the markup
+    between an anchor element and the date. Returns "" on any miss, so the
+    caller falls back to the normal date chain.
+    """
+    if not pattern or not html:
+        return ""
+    m = re.search(pattern, html, re.IGNORECASE | re.DOTALL)
+    if not m:
+        return ""
+    raw = m.groupdict().get("date") or (m.group(1) if m.re.groups else m.group(0))
+    return _parse_loose_date(raw)
 
 
 def date_from_slug(url: str, source_cfg: dict) -> str:
@@ -1437,7 +1507,8 @@ def process_source(source: str, source_cfg: dict, defaults: dict,
             else:
                 extracted = fetch_and_extract(url, sid=source_cfg.get("sid"),
                                                fetcher=source_cfg.get("fetcher", ""),
-                                               strip_after=source_cfg.get("strip_after", ""))
+                                               strip_after=source_cfg.get("strip_after", ""),
+                                               date_regex=source_cfg.get("date_regex", ""))
             if not extracted:
                 # Bump the per-URL failure counter; promote to .failed at threshold.
                 attempts[url] = attempts.get(url, 0) + 1
@@ -1514,7 +1585,8 @@ def fetch_one(url: str, slug: str, config: dict, *,
     else:
         extracted = fetch_and_extract(url, sid=source_cfg.get("sid"),
                                       fetcher=source_cfg.get("fetcher", ""),
-                                      strip_after=source_cfg.get("strip_after", ""))
+                                      strip_after=source_cfg.get("strip_after", ""),
+                                      date_regex=source_cfg.get("date_regex", ""))
     if not extracted:
         print(f"  ✗ [{slug}] extraction failed — nothing written.")
         return 1
