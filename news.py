@@ -1542,6 +1542,12 @@ def process_source(source: str, source_cfg: dict, defaults: dict,
             slug_date = date_from_slug(url, source_cfg)
             if slug_date:
                 meta["date"] = slug_date
+            # `ignore_dates` lists dates known to be CMS artifacts rather than
+            # publish dates (Anthropic's siteSettings 2023-11-03). On a hit,
+            # fall back to the sitemap lastmod, else today — right for a page
+            # the scheduled poll picks up soon after it goes live.
+            if any(meta.get("date", "").startswith(d) for d in source_cfg.get("ignore_dates", [])):
+                meta["date"] = discovery_date or datetime.now(timezone.utc).date().isoformat()
             out_path, content, published = render_article(source, url, body, meta, discovery_date)
             body_len = len(body)
         out_path.parent.mkdir(parents=True, exist_ok=True)
