@@ -8,7 +8,7 @@ Companion to ss.py (which handles podcast audio). Same conventions:
 - SD-card backup mirroring (when backup_path is configured)
 
 Discovery is pluggable per source: RSS feeds via feedparser, sitemap.xml
-via simple regex parsing. Body extraction is uniform: trafilatura pulls
+via simple regex parsing, index pages via a per-source `item_regex`. Body extraction is uniform: trafilatura pulls
 the main article content as markdown and the canonical publish date
 from <meta> tags, falling back to the sitemap's <lastmod> when needed.
 Sources whose date trafilatura reads wrong override it with a per-source
@@ -27,6 +27,7 @@ import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
+from urllib.parse import urljoin
 
 import feedparser
 import requests
@@ -520,8 +521,48 @@ def discover(source_cfg: dict) -> list[tuple]:
         return discover_substack_archive(source_cfg)
     if t == "static-markdown-spa":
         return [(u, d, ti, None) for u, d, ti in discover_static_markdown_spa(source_cfg)]
+    if t == "html-listing":
+        return [(u, d, ti, None) for u, d, ti in discover_html_listing(source_cfg)]
     raise ValueError(f"Unknown source type: {t!r}")
 
+
+# ── HTML listing page ────────────────────────────────────────────────────────
+
+def discover_html_listing(source_cfg: dict) -> list[tuple[str, str, str]]:
+    """Discover articles from the cards on a server-rendered index page.
+
+    For publishers whose index links to pages a sitemap path filter can't
+    single out. Anthropic's /news mixes /news/ posts with top-level launch
+    pages (/claude-opus-5-5), threat reports and /features/ pieces, each
+    card carrying the real publish date — which those bespoke pages often
+    lack in their own markup.
+
+    `item_regex` is matched (DOTALL) against the listing HTML and must supply
+    a `url` group; `date` and `title` groups are optional. Relative URLs
+    resolve against `listing_url`. The listing date is authoritative for the
+    article (see process_source). Only what the server renders is visible —
+    client-side "see more" pages aren't — so this relies on regular polling.
+    """
+    listing_url = source_cfg["listing_url"]
+    pattern = re.compile(source_cfg["item_regex"], re.DOTALL)
+    path_exclude = source_cfg.get("path_exclude", "")
+    excludes = [path_exclude] if isinstance(path_exclude, str) else path_exclude
+    excludes = [e for e in excludes if e]
+
+    r = requests.get(listing_url, headers={"User-Agent": DEFAULT_USER_AGENT}, timeout=HTTP_TIMEOUT)
+    r.raise_for_status()
+
+    out: list[tuple[str, str, str]] = []
+    seen: set[str] = set()
+    for m in pattern.finditer(r.text):
+        g = m.groupdict()
+        u = urljoin(listing_url, g["url"].strip())
+        if u in seen or any(ex in u for ex in excludes):
+            continue
+        seen.add(u)
+        title = re.sub(r"<[^>]+>", "", g.get("title") or "").strip()
+        out.append((u, _parse_loose_date(g.get("date") or ""), title))
+    return out
 
 # ── Substack section archive ─────────────────────────────────────────────────
 
@@ -1548,6 +1589,11 @@ def process_source(source: str, source_cfg: dict, defaults: dict,
             # the scheduled poll picks up soon after it goes live.
             if any(meta.get("date", "").startswith(d) for d in source_cfg.get("ignore_dates", [])):
                 meta["date"] = discovery_date or datetime.now(timezone.utc).date().isoformat()
+            # An html-listing card's date is the publisher's own publish date;
+            # the page itself may carry none, a CMS artifact, or an event date
+            # (the Ebola sitrep's dateline is three days before it went up).
+            if source_cfg.get("type") == "html-listing" and discovery_date:
+                meta["date"] = discovery_date
             out_path, content, published = render_article(source, url, body, meta, discovery_date)
             body_len = len(body)
         out_path.parent.mkdir(parents=True, exist_ok=True)
