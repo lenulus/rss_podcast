@@ -395,6 +395,7 @@ def discover_sitemap(source_cfg: dict) -> list[tuple[str, str, str]]:
     url = source_cfg["sitemap_url"]
     path_filter = source_cfg.get("path_filter", "")
     path_exclude = source_cfg.get("path_exclude", "")
+    path_regex = source_cfg.get("path_regex", "")
     sub_filter = source_cfg.get("sub_sitemap_filter", "")
     cutoff = parse_since(source_cfg.get("since"))
     fetcher = source_cfg.get("fetcher", "")
@@ -420,7 +421,8 @@ def discover_sitemap(source_cfg: dict) -> list[tuple[str, str, str]]:
         for sub in sub_locs:
             try:
                 out.extend(_parse_urlset(_get_text(sub), path_filter, cutoff,
-                                          sitemap_url=sub, path_exclude=path_exclude))
+                                          sitemap_url=sub, path_exclude=path_exclude,
+                                          path_regex=path_regex))
             except Exception as e:
                 print(f"    ⚠ sub-sitemap fetch failed for {sub}: {e}")
             time.sleep(0.3)
@@ -429,11 +431,13 @@ def discover_sitemap(source_cfg: dict) -> list[tuple[str, str, str]]:
         return out
     return _parse_urlset(body, path_filter, cutoff,
                           since_label=source_cfg.get("since"),
-                          sitemap_url=url, path_exclude=path_exclude)
+                          sitemap_url=url, path_exclude=path_exclude,
+                          path_regex=path_regex)
 
 
 def _parse_urlset(body: str, path_filter: str, cutoff=None, since_label=None,
-                  sitemap_url: str = "", path_exclude: str = "") -> list[tuple[str, str, str]]:
+                  sitemap_url: str = "", path_exclude: str = "",
+                  path_regex: str = "") -> list[tuple[str, str, str]]:
     # Derive scheme + host from the sitemap URL so we can repair scheme-less
     # <loc> entries like `cognition.ai/blog/foo` (which some CMSs emit despite
     # the sitemap spec requiring absolute URLs).
@@ -461,6 +465,11 @@ def _parse_urlset(body: str, path_filter: str, cutoff=None, since_label=None,
                 u = host_prefix + ("" if u.startswith("/") else "/") + u
         if path_filter and path_filter not in u:
             continue
+        # `path_regex` is for URL families a single substring can't pin down,
+        # e.g. Anthropic's top-level launch pages (/claude-opus-5-5) that sit
+        # beside /claude/opus product pages and ~60 legal/careers pages.
+        if path_regex and not re.search(path_regex, u):
+            continue
         if path_exclude:
             # Accept either a single substring or a list of substrings, so a
             # source can drop several non-article path families at once
@@ -469,7 +478,7 @@ def _parse_urlset(body: str, path_filter: str, cutoff=None, since_label=None,
             if any(ex in u for ex in excludes):
                 continue
         # Skip the index pages themselves (e.g. /news, /blog with no trailing path)
-        if u.rstrip("/").endswith(path_filter.rstrip("/")):
+        if path_filter and u.rstrip("/").endswith(path_filter.rstrip("/")):
             continue
         lastmod_m = re.search(r"<lastmod[^>]*>([^<]+)</lastmod>", block, re.IGNORECASE)
         lastmod = lastmod_m.group(1).strip() if lastmod_m else ""
