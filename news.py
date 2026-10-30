@@ -566,6 +566,19 @@ def discover_html_listing(source_cfg: dict) -> list[tuple[str, str, str]]:
     r = requests.get(listing_url, headers={"User-Agent": DEFAULT_USER_AGENT}, timeout=HTTP_TIMEOUT)
     r.raise_for_status()
 
+    # `date_header_regex`: for indexes that group undated cards under month
+    # headings ('<div class="date">June 2025</div>' on alignment.anthropic.com)
+    # rather than dating each card. A card with no date of its own takes the
+    # last heading above it, as month-only 'YYYY-MM'; process_source then
+    # keeps the page's own date if it falls in that month, else uses the 1st.
+    headers: list[tuple[int, str]] = []
+    if source_cfg.get("date_header_regex"):
+        for h in re.finditer(source_cfg["date_header_regex"], r.text, re.DOTALL):
+            hm = re.search(r"([A-Za-z]{3,9})\.?\s+(\d{4})", h.group("date"))
+            month = _MONTHS.get(hm.group(1)[:3].lower()) if hm else None
+            if month:
+                headers.append((h.start(), f"{hm.group(2)}-{month:02d}"))
+
     out: list[tuple[str, str, str]] = []
     seen: set[str] = set()
     for m in (m for p in patterns for m in p.finditer(r.text)):
@@ -575,7 +588,11 @@ def discover_html_listing(source_cfg: dict) -> list[tuple[str, str, str]]:
             continue
         seen.add(u)
         title = re.sub(r"<[^>]+>", "", g.get("title") or "").strip()
-        out.append((u, _parse_loose_date(g.get("date") or ""), title))
+        date = _parse_loose_date(g.get("date") or "")
+        if not date:
+            above = [d for pos, d in headers if pos < m.start()]
+            date = above[-1] if above else ""
+        out.append((u, date, title))
     return out
 
 # ── Substack section archive ─────────────────────────────────────────────────
@@ -1606,8 +1623,15 @@ def process_source(source: str, source_cfg: dict, defaults: dict,
             # An html-listing card's date is the publisher's own publish date;
             # the page itself may carry none, a CMS artifact, or an event date
             # (the Ebola sitrep's dateline is three days before it went up).
+            # A month-only 'YYYY-MM' (from date_header_regex) is coarser than a
+            # page date, so it only overrides one that lands outside its month
+            # (alignment posts whose prose cites a 2010 paper).
             if source_cfg.get("type") == "html-listing" and discovery_date:
-                meta["date"] = discovery_date
+                if len(discovery_date) == 7:
+                    if not meta.get("date", "").startswith(discovery_date):
+                        meta["date"] = f"{discovery_date}-01"
+                else:
+                    meta["date"] = discovery_date
             out_path, content, published = render_article(source, url, body, meta, discovery_date)
             body_len = len(body)
         out_path.parent.mkdir(parents=True, exist_ok=True)

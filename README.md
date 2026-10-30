@@ -393,7 +393,7 @@ Each `[sources.<slug>]` block has a `type` that decides how articles are discove
 | `rss` | An RSS/Atom feed. Only the links are used — each article page is fetched for the full body. | `url` |
 | `rss-inline` | An RSS feed that carries the whole article in the feed itself. No per-article request is made, which suits paywalled feeds whose pages only return a teaser. | `url` |
 | `sitemap` | A `sitemap.xml` (or sitemap index), filtered down to the article URLs. | `sitemap_url`, `path_filter`, `path_regex`, `path_exclude`, `sub_sitemap_filter` |
-| `html-listing` | The cards on a server-rendered index page, matched by a regex (or a list of regexes, for indexes that mix card layouts). The card's date is treated as the publish date. | `listing_url`, `item_regex`, `path_exclude` |
+| `html-listing` | The cards on a server-rendered index page, matched by a regex (or a list of regexes, for indexes that mix card layouts). The card's date is treated as the publish date. | `listing_url`, `item_regex`, `path_exclude`, `date_header_regex` (month headings for undated cards) |
 | `substack-section-archive` | Substack's paginated archive API for one section — the full history, where RSS stops at the 20 most recent. | `base_url`, `section_id`, `sid` |
 | `static-markdown-spa` | Client-rendered sites that load raw `.md` files at runtime; slugs are read out of the JS bundle. | `base_url`, `bundle_regex`, `slug_regex`, `article_url_template` |
 | `hf-daily-papers` | Hugging Face Daily Papers, via its JSON API. Writes one file per paper with the abstract and metadata. | `discovery_mode`, `min_upvotes`, `top_n`, `fetch_fulltext` |
