@@ -131,11 +131,6 @@ sitemap_url = "https://www.anthropic.com/sitemap.xml"
 path_filter = "/research/"
 date_regex = '''PostDetail-module[^"]*__title"[^>]*>.*?<div class="body-3 agate">(?P<date>[A-Z][a-z]{2} \d{1,2}, \d{4})</div>'''
 
-[sources.anthropic-engineering]
-type = "sitemap"
-sitemap_url = "https://www.anthropic.com/sitemap.xml"
-path_filter = "/engineering/"
-
 # /sitemap.xml 404s; robots.txt points at /sitemap-index.xml. The host-qualified
 # path_filter keeps the English /news/ posts and drops localized /fr/news/, /it/news/.
 [sources.mistral]

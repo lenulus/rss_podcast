@@ -547,13 +547,18 @@ def discover_html_listing(source_cfg: dict) -> list[tuple[str, str, str]]:
     lack in their own markup.
 
     `item_regex` is matched (DOTALL) against the listing HTML and must supply
-    a `url` group; `date` and `title` groups are optional. Relative URLs
+    a `url` group; `date` and `title` groups are optional. It may also be a
+    list of patterns, for indexes that mix card layouts whose url and date
+    appear in different orders (one regex can't name a group twice); the
+    first pattern to yield a URL wins. Relative URLs
     resolve against `listing_url`. The listing date is authoritative for the
     article (see process_source). Only what the server renders is visible —
     client-side "see more" pages aren't — so this relies on regular polling.
     """
     listing_url = source_cfg["listing_url"]
-    pattern = re.compile(source_cfg["item_regex"], re.DOTALL)
+    item_regex = source_cfg["item_regex"]
+    patterns = [re.compile(p, re.DOTALL)
+                for p in ([item_regex] if isinstance(item_regex, str) else item_regex)]
     path_exclude = source_cfg.get("path_exclude", "")
     excludes = [path_exclude] if isinstance(path_exclude, str) else path_exclude
     excludes = [e for e in excludes if e]
@@ -563,7 +568,7 @@ def discover_html_listing(source_cfg: dict) -> list[tuple[str, str, str]]:
 
     out: list[tuple[str, str, str]] = []
     seen: set[str] = set()
-    for m in pattern.finditer(r.text):
+    for m in (m for p in patterns for m in p.finditer(r.text)):
         g = m.groupdict()
         u = urljoin(listing_url, g["url"].strip())
         if u in seen or any(ex in u for ex in excludes):
