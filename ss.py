@@ -1129,8 +1129,10 @@ def transcribe_chunked(mp3_path: Path, whisper, chunk_seconds: int = CHUNK_SECON
                 text = (cached.get("text") or "").strip()
                 segments = cached.get("segments") or []
             else:
-                chunk_path = tmp / f"chunk_{i:03d}.mp3"
-                # `-ss` before `-i` seeks before reading — fast for mp3 stream copy.
+                # Matroska accepts any codec, so stream copy works even when a
+                # feed serves AAC under a .mp3 name (the mp3 muxer rejects it).
+                chunk_path = tmp / f"chunk_{i:03d}.mka"
+                # `-ss` before `-i` seeks before reading — fast for stream copy.
                 subprocess.run([
                     "ffmpeg", "-y", "-loglevel", "error",
                     "-ss", str(start), "-i", str(mp3_path),
