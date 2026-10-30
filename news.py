@@ -189,7 +189,10 @@ def _url_keys(url: str) -> tuple[str, str]:
     """
     from urllib.parse import urlsplit
     s = urlsplit(url.strip())
-    host = (s.netloc or "").lower()
+    # 'www.' is dropped so a site moving between www and the apex (Latent
+    # Space, www.latent.space → latent.space on leaving Substack) doesn't make
+    # its whole back catalog look new.
+    host = (s.netloc or "").lower().removeprefix("www.")
     path = s.path.rstrip("/")
     # Query-string permalinks put their whole identity in the query: WordPress
     # '?p=<id>' guids (8 of the 50 items in Stratechery's Passport feed) have an
@@ -345,8 +348,14 @@ def discover_rss_inline(source_cfg: dict) -> list[tuple]:
     skipped = 0
     empty = 0
     for e in feed.entries:
-        # guid first (stable canonical permalink), link second.
-        link = (e.get("id") or "").strip() or (e.get("link") or "").strip()
+        # guid first (stable canonical permalink), link second. An opaque guid
+        # ('urn:latent-space:post:post_<uuid>', Latent Space on Beehiiv) is
+        # stable but not a URL — it'd make a junk filename and frontmatter
+        # url — so only an http(s) guid wins over link.
+        guid = (e.get("id") or "").strip()
+        if not guid.startswith(("http://", "https://")):
+            guid = ""
+        link = guid or (e.get("link") or "").strip()
         if not link:
             continue
         link = link.split("#", 1)[0]
