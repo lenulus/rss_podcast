@@ -57,6 +57,15 @@ All other args (`--diarize-only`, `--subprocess-concurrency`, `--model`, etc.) p
 | `<backup_path>/<tag>/text/*.md` | tool | SD card transcript archive (mtime-synced) |
 | `<backup_path>/<tag>/text/.diarize/*.json` | tool | SD card diarize-cache backup (mtime-synced; preserves hours of pyannote compute across fresh-clone / disaster-recovery) |
 
+Search and reports (see `README.md` § Local search and `docs/reports-pipeline.md`):
+
+| Path | Owner | What |
+|---|---|---|
+| `.venv-search/` | user | separate venv for `build_index.py`, `search.py`, `specials.py` (`./setup.sh --search`, `requirements-search.txt`) |
+| `search_index/` | tool | **gitignored**, ~1.3 GB: `index.db` (docs, chunks, FTS5, fp16 vectors) + `vectors.npy` / `vector_ids.npy` / `meta.json`; refreshed by the daily task after transcription; `.build.lock` serializes refreshes |
+| `reports/` | tool | **gitignored**: weekly and 48-hour briefs, `story-log.yaml`, `forward-trends/<RUN>/`, `specials/<RUN>/` |
+| `prompts/` | user | **gitignored**: the report prompts, versioned with a `-current` suffix (see the READMEs in `prompts/forward-trends/` and `prompts/specials/`) |
+
 `<backup_path>` comes from `[defaults]` or per-feed `backup_path` in `feeds.toml`. The script never deletes anything on the SD card. Local mp3s are only deleted if (a) a transcript exists in `.processed`, and (b) the backup path is reachable.
 
 ## Command map
@@ -247,5 +256,8 @@ Don't push without explicit user instruction. Don't commit `feeds.toml`, `CLAUDE
 ## Pointers
 
 - `ss.py` — single-file implementation; all CLI flags wired in `main()` near the bottom
+- `build_index.py` / `search.py` — local hybrid search index and query CLI (`README.md` § Local search)
+- `specials.py` — per-topic input builder for the monthly topic reports
+- `docs/reports-pipeline.md` — scheduled jobs, where each runs, data flow
 - `README.md` — user-facing setup + feature docs
 - `CLAUDE.md` — wiki-pattern conventions for synthesizing transcripts into a knowledge layer (separate concern)

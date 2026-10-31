@@ -5,6 +5,8 @@ Two companion pipelines that turn feeds into local, greppable Markdown:
 - **Podcasts** (`ss.py`, via `./run.sh`) — download, index, and transcribe episodes from one or more podcast RSS feeds (Substack or otherwise). Most of this README covers this pipeline.
 - **News** (`news.py`, via `./news.sh`) — pull full article text from AI-company blogs, newsletters, and paper feeds. See [News ingestion](#news-ingestion-newspy).
 
+On top of both sits a **local search index** (`build_index.py`, `search.py`) that finds passages by keyword and by meaning across transcripts, articles and the Week in AI briefs. See [Local search](#local-search-build_indexpy-searchpy). The scheduled report pipeline that consumes all of this is described in `docs/reports-pipeline.md`.
+
 Transcription runs locally on Apple Silicon via [mlx-whisper](https://github.com/ml-explore/mlx-examples/tree/main/whisper) — no API keys or cloud services required.
 
 ## Prerequisites
@@ -23,6 +25,8 @@ cp news.example.toml news.toml     # optional — only if you want news ingestio
 ```
 
 `setup.sh` creates a `.venv` and installs `requirements.txt`. `feeds.toml` and `news.toml` are gitignored — they hold private RSS URLs and session cookies.
+
+For local search, `./setup.sh --search` creates a second venv, `.venv-search`, from `requirements-search.txt` (sentence-transformers and its own torch). It stays separate so the transcription venv doesn't carry a second torch stack.
 
 ## Configuring feeds
 
@@ -219,8 +223,9 @@ cp feeds.example.toml feeds.toml      # edit with your RSS URLs
 # 6. Pull new articles from every configured news source (optional)
 ./news.sh --all
 
-# 7. Search transcripts and articles
-grep -rl "context engineering" ./transcripts/ ./news/
+# 7. Refresh the search index (incremental), then search by keyword or meaning
+.venv-search/bin/python build_index.py
+.venv-search/bin/python search.py "context engineering" --since 2026-01-01
 ```
 
 ## Output format
@@ -448,6 +453,30 @@ Articles ingested with `--fetch-one` are tagged `[news, backfilled]`. Hugging Fa
 
 Body extraction uses [trafilatura](https://trafilatura.readthedocs.io/), with a plainer HTML-to-text fallback when it returns nothing. Dedup compares normalized URLs, so a change of scheme, a trailing slash, or a site moving its posts under a new path prefix doesn't cause a re-fetch.
 
+## Local search (`build_index.py`, `search.py`)
+
+A hybrid index over everything the two pipelines write, plus the Week in AI briefs. Keyword search (SQLite FTS5, BM25) finds exact names, model versions and figures; vector search ([Qwen3-Embedding-0.6B](https://huggingface.co/Qwen/Qwen3-Embedding-0.6B)) finds the same claim in different words. Results are merged by reciprocal-rank fusion. Everything runs locally; the model downloads once from Hugging Face.
+
+```bash
+./setup.sh --search                               # once
+.venv-search/bin/python build_index.py            # build or refresh (incremental)
+.venv-search/bin/python search.py "agent escaped its sandbox" --since 2026-07-01
+.venv-search/bin/python search.py '"20 GW"' --mode keyword --source semianalysis
+.venv-search/bin/python search.py "Sonnet 5.5 free tier" --corpus briefs -k 20 --json
+```
+
+**Corpora.** `raw` (the default) is `news/*/*.md` and `transcripts/*/*.md`. `briefs` is `reports/the-week-in-ai-*.md` and `reports/story-log.yaml`. `--corpus all` searches both.
+
+**Filters.** `--since` / `--until` (YYYY-MM-DD, by the date in the filename; undated files only match unfiltered searches), `--source` (a source name such as `openai`, `nates-notebook` or `the-week-in-ai`, or a path glob containing a slash such as `'transcripts/*'`; repeatable), `--mode hybrid|keyword|vector`, `-k`, `--per-doc`, `--sort score|date`.
+
+**Results** are one passage per document, cited as `path:start_line-end_line`. They are leads to open and read, not evidence on their own. Quote a phrase (`'"108x"'`) for an exact match; plain words are OR'd for keyword ranking and embedded as-is for meaning. In hybrid mode the top three keyword documents always stay in the results, so an exact hit the vectors miss isn't dropped.
+
+**Indexing.** Files are split into ~450-word chunks with 50 words of overlap, keeping line ranges. AINews digests (`latent-space-ainews`) are split per item instead (at most 200 words, no overlap) and embedded without the issue title, because one digest covers many unrelated stories. A refresh re-chunks only files whose size or modification time changed, drops deleted files, and embeds only chunks without a vector. One refresh runs at a time (a lock file), and the vector matrix is replaced atomically. A full build is ~130k chunks and about 2.5 hours on an M2 Ultra; a day's new files take a minute or two.
+
+**Storage.** `search_index/` (gitignored, ~1.3 GB): `index.db` (SQLite: docs, chunks, FTS5 table, fp16 vectors), plus `vectors.npy`, `vector_ids.npy` and `meta.json`, which `search.py` loads. Delete the folder to rebuild from scratch.
+
+**Blind runs.** When `SEARCH_BLIND_RUN=<run folder>` is set, `search.py` refuses the `briefs` corpus until `<run folder>/freeze.txt` exists. The forward-trends analysis uses this to keep its trend work blind to what the weekly already covered.
+
 ## Further reading
 
 - `CLI_README.md` — operator runbook: recommended configuration, command map, precedence rules, failure recovery, performance reference
@@ -456,3 +485,5 @@ Body extraction uses [trafilatura](https://trafilatura.readthedocs.io/), with a 
 - `docs/news-substack-auth.md` — how to get the `connect.sid` cookie for paid Substack sources
 - `docs/news-hf-papers-design.md` — design notes for Hugging Face Daily Papers ingestion
 - `docs/lessons-learned.md` — notes from tuning transcribe-pipeline throughput
+- `docs/reports-pipeline.md` — the scheduled jobs that turn the corpus into the Week in AI briefs, forward-trends analyses and topic reports, and where each one runs
+- `specials.py` — input builder for the monthly topic reports (see its docstring)

@@ -1,0 +1,11 @@
+# Local hybrid search (build_index.py, search.py) and the topic-report input
+# builder (specials.py). Kept out of requirements.txt so the transcription venv
+# doesn't carry a second torch stack: these install into .venv-search
+# (./setup.sh --search). Versions are the ones the index was built and tested with.
+#
+# The embedding model, Qwen/Qwen3-Embedding-0.6B (~1.2 GB), downloads from
+# Hugging Face on first use. Embedding runs on the Apple GPU (MPS) when present.
+sentence-transformers==6.2.0
+torch==2.15.0
+numpy==2.5.4
+PyYAML==6.0.3

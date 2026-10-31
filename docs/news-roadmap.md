@@ -19,6 +19,15 @@ Status, test plan, and pending work for the news ingestion pipeline. Keep this c
 - **`fetcher = "curl"` per-source option.** Routes a source's sitemap discovery + per-article fetch through the system `curl` binary instead of `requests`, for sites behind TLS-fingerprinting bot challenges (`_curl_get`). Landed for Vercel — see Known limitations below.
 - **`path_exclude` accepts a list.** Was a single substring; now also takes `["/a/", "/b/"]` to drop several non-article path families at once (Replit's `/blog/author/` + `/blog/category/`). String form is unchanged/backward-compatible.
 - **4 new sitemap sources:** `langchain` (`www.langchain.com/blog/`), `openrouter` (`/announcements/`), `replit` (`replit.com/blog/`, dual path_exclude), `vercel` (`/blog/`, `fetcher = "curl"`). Each smoke-tested `--limit 1` and hand-reviewed.
+- **More source types** (see the README's source-type table for settings):
+  - `hf-daily-papers` (2026-05-17, `830fcd6`): Hugging Face Daily Papers via the JSON API, with `min_upvotes` / `top_n` filters. Built to the design in `docs/news-hf-papers-design.md`.
+  - `substack-section-archive` (2026-05-17, `14d9a20`): full-history backfill of a Substack section. No configured source uses it now; it's for one-off backfills.
+  - `static-markdown-spa` (2026-05-19, `ee52f9d`): JS-rendered sites that load posts as raw `.md` files. Built for antigravity.google, which has since published a sitemap and is now a `sitemap` source; no configured source uses this type now.
+  - `rss-inline` (2026-08-14, `82d3e7c`): feeds that carry the full article body (Latent Space AINews, Stratechery Passport).
+  - `html-listing` (2026-09-26, `1acacda`): index pages with dated cards; `item_regex` may be a list, and `date_header_regex` dates cards under month headings (Anthropic alignment).
+- **Meta:** `meta-eng` (engineering.fb.com RSS) and `meta-research` (research.meta.ai, sitemap with `path_filter = "/blog/"`, 2026-10-30). The ai.meta.com blog itself still has no feed or sitemap; research.meta.ai carries the research posts.
+- **Dedup across site moves** (2026-10-30): `.processed` matching ignores `www.` and also matches on the URL slug, so a source moving hosts or path prefixes (Latent Space leaving Substack) doesn't re-fetch.
+- **Local search index** over `news/`, `transcripts/` and the briefs: `build_index.py` / `search.py` (README § Local search).
 
 ### Smoke-tested
 
@@ -26,7 +35,7 @@ Status, test plan, and pending work for the news ingestion pipeline. Keep this c
 
 ### Designed but unbuilt
 
-- **HF Daily Papers ingestion** — full design in `docs/news-hf-papers-design.md`. ~150 lines to add to `news.py`: `discover_hf_daily_papers`, `discover_hf_weekly_papers`, `render_hf_paper`, filter logic (`min_upvotes` + `top_n` with don't-touch-`.processed` semantics for filtered entries), type dispatch.
+- Nothing outstanding. (HF Daily Papers, listed here until 2026-10-31, shipped on 2026-05-17.)
 
 ## Untested code paths
 
@@ -74,9 +83,9 @@ Caveat: this defeats *fingerprint*-based blocks, not JS-challenge tiers (Cloudfl
 
 ## Pending build work
 
-### 1. HF Daily Papers (highest leverage)
+### 1. HF Daily Papers (done 2026-05-17, `830fcd6`)
 
-Design complete (`docs/news-hf-papers-design.md`). Implementation order:
+Kept for the record. Design: `docs/news-hf-papers-design.md`. Implementation order as built:
 
 1. Add `discover_hf_daily_papers(cfg)` — GET `/api/daily_papers`, return `(url, date, title, payload)` tuples with the JSON payload riding along.
 2. Add `discover_hf_weekly_papers(cfg)` — fetch weekly HTML, regex arxiv IDs, GET each via `/api/papers/<id>` for structured payload.
@@ -86,9 +95,11 @@ Design complete (`docs/news-hf-papers-design.md`). Implementation order:
 6. Update `news.example.toml` with worked `[sources.hf-papers]` block.
 7. Smoke-test: `./news.sh --source hf-papers --check` (preview filter), then `--limit 3` (actual ingest), inspect output.
 
-### 2. Meta AI (lowest priority, hardest case)
+### 2. Meta AI (done 2026-10-30, as `meta-research` + `meta-eng`)
 
-No RSS, no sitemap. Two paths to evaluate when we get there:
+Resolved without scraping: research.meta.ai publishes a sitemap that lists its blog posts, and engineering.fb.com has RSS. The options below were for ai.meta.com/blog, which still has neither; revisit only if it publishes posts research.meta.ai doesn't carry.
+
+Original options:
 
 - **Direct CSS scraping** — point at `https://ai.meta.com/blog/`, extract post links via selector, then fetch each via trafilatura. Adds a `type = "html"` source kind with a selector field. Fragile — Meta's site has rebuilt twice in living memory.
 - **Third-party converter** — RSSHub publishes a feed at `https://rsshub.app/meta/ai/blog` that does the scraping for us. Less fragile but adds a dependency on a hosted service.
