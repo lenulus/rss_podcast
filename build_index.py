@@ -24,6 +24,7 @@ doesn't carry):
 """
 
 import argparse
+import fcntl
 import json
 import os
 import re
@@ -37,6 +38,7 @@ import numpy as np
 ROOT = Path(__file__).resolve().parent
 INDEX_DIR = ROOT / "search_index"
 DB_PATH = INDEX_DIR / "index.db"
+LOCK_PATH = INDEX_DIR / ".build.lock"
 MODEL = "Qwen/Qwen3-Embedding-0.6B"
 CHUNK_WORDS = 450       # ~600 tokens
 OVERLAP_WORDS = 50
@@ -252,8 +254,12 @@ def export_vectors(db: sqlite3.Connection) -> None:
         return
     ids = np.array([r[0] for r in rows], dtype=np.int64)
     mat = np.frombuffer(b"".join(r[1] for r in rows), dtype=np.float16).reshape(len(rows), -1)
-    np.save(INDEX_DIR / "vectors.npy", mat)
-    np.save(INDEX_DIR / "vector_ids.npy", ids)
+    # Write then rename, so a search running meanwhile never loads a partial file.
+    for name, arr in (("vectors.npy", mat), ("vector_ids.npy", ids)):
+        tmp = INDEX_DIR / f".{name}.tmp"
+        with open(tmp, "wb") as f:
+            np.save(f, arr)
+        os.replace(tmp, INDEX_DIR / name)
     (INDEX_DIR / "meta.json").write_text(json.dumps({
         "model": MODEL, "dims": int(mat.shape[1]), "chunk_words": CHUNK_WORDS,
         "overlap_words": OVERLAP_WORDS, "chunks": int(len(ids)),
@@ -266,6 +272,14 @@ def main() -> None:
     ap.add_argument("--since", default="", help="embed only raw docs dated on/after YYYY-MM-DD")
     ap.add_argument("--until", default="", help="embed only raw docs dated on/before YYYY-MM-DD")
     args = ap.parse_args()
+    # Scheduled runs and report prompts all refresh the index; one at a time.
+    INDEX_DIR.mkdir(exist_ok=True)
+    lock = open(LOCK_PATH, "w")
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        print("another build_index.py is running; waiting for it…", flush=True)
+        fcntl.flock(lock, fcntl.LOCK_EX)
     db = open_db()
     t = time.time()
     n = sync_docs(db)
@@ -274,7 +288,8 @@ def main() -> None:
     if not args.no_embed:
         e = embed_missing(db, args.since, args.until)
         print(f"embedded {e} new chunks")
-        export_vectors(db)
+        if e or n or not (INDEX_DIR / "vectors.npy").exists():
+            export_vectors(db)
     db.execute("INSERT INTO chunks_fts(chunks_fts) VALUES('optimize')")
     db.commit()
 

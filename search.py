@@ -77,6 +77,7 @@ def _chunk_meta() -> dict:
     return {
         "ids": ids,
         "corpus": np.array([m[0] for m in meta]),
+        "source": np.array([m[1] for m in meta]),
         "date": np.array([m[2] for m in meta]),
         "path": np.array([m[3] for m in meta]),
     }
@@ -120,8 +121,10 @@ def _filters_sql(corpora, since, until, sources) -> tuple[str, list]:
     if until:
         sql.append("d.date <= ?"); args.append(until)
     if sources:
-        sql.append("(" + " OR ".join("d.path GLOB ?" for _ in sources) + ")")
-        args += [s if "/" in s else f"*/{s}/*" for s in sources]
+        # A bare name is a source (folder name, or the-week-in-ai / story-log
+        # for briefs); anything with a slash is a path glob.
+        sql.append("(" + " OR ".join("d.path GLOB ?" if "/" in s else "d.source = ?" for s in sources) + ")")
+        args += list(sources)
     return " AND ".join(sql), args
 
 
@@ -146,10 +149,11 @@ def vector_rank(q, corpora, since, until, sources) -> list[int]:
     if until:
         mask &= m["date"] <= until
     if sources:
-        pats = [s if "/" in s else f"*/{s}/*" for s in sources]
+        pats = [s for s in sources if "/" in s]
+        names = [s for s in sources if "/" not in s]
         uniq = np.unique(m["path"][mask])
         ok = {p for p in uniq if any(fnmatch.fnmatch(p, pat) for pat in pats)}
-        mask &= np.isin(m["path"], list(ok))
+        mask &= np.isin(m["path"], list(ok)) | np.isin(m["source"], names)
     rows = np.nonzero(mask)[0]
     if not len(rows):
         return []
@@ -230,7 +234,8 @@ def main() -> None:
     ap.add_argument("--since", help="YYYY-MM-DD (doc date, inclusive)")
     ap.add_argument("--until", help="YYYY-MM-DD (doc date, inclusive)")
     ap.add_argument("--source", action="append", default=[],
-                    help="source folder name (openai) or path glob (transcripts/*); repeatable")
+                    help="source name (openai, nates-notebook, the-week-in-ai, story-log) "
+                         "or path glob with a slash (transcripts/*); repeatable")
     ap.add_argument("--mode", choices=["hybrid", "keyword", "vector"], default="hybrid")
     ap.add_argument("-k", type=int, default=10)
     ap.add_argument("--per-doc", type=int, default=1, help="max passages per document")
