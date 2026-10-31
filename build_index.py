@@ -189,11 +189,15 @@ def embed_missing(db: sqlite3.Connection, since: str = "", until: str = "", batc
     go first and the backlog follow."""
     import torch
     from sentence_transformers import SentenceTransformer
-    todo = db.execute("""SELECT c.id, d.title, c.text FROM chunks c JOIN docs d ON d.id=c.doc_id
-                         LEFT JOIN vec v ON v.chunk_id=c.id
-                         WHERE v.chunk_id IS NULL
-                           AND (d.corpus='briefs' OR (d.date >= ? AND d.date <= ?))
-                         ORDER BY c.id""", (since or "0000", until or "9999")).fetchall()
+    # With no range, undated docs (date '') are included too.
+    rng, args = "", []
+    if since or until:
+        rng = "AND (d.corpus='briefs' OR (d.date >= ? AND d.date <= ?))"
+        args = [since or "0000", until or "9999"]
+    todo = db.execute(f"""SELECT c.id, d.title, c.text FROM chunks c JOIN docs d ON d.id=c.doc_id
+                          LEFT JOIN vec v ON v.chunk_id=c.id
+                          WHERE v.chunk_id IS NULL {rng}
+                          ORDER BY c.id""", args).fetchall()
     if not todo:
         return 0
     print(f"  embedding {len(todo)} chunks with {MODEL}…", flush=True)
