@@ -41,6 +41,19 @@ MODEL = "Qwen/Qwen3-Embedding-0.6B"
 CHUNK_WORDS = 450       # ~600 tokens
 OVERLAP_WORDS = 50
 MAX_SEQ = 1024
+# Digests pack many unrelated items into a few hundred words, which blurs a
+# 450-word chunk's embedding (the 2026-09 replay: an AINews item on agents
+# editing their own traces was BM25 #1 and missing from the vector top 200).
+# Their chunks are smaller and start at item boundaries instead.
+DIGEST_SOURCES = {"latent-space-ainews"}
+DIGEST_WORDS = 200
+DIGEST_MIN_WORDS = 25   # merge items shorter than this into the next one
+ITEM_START_RE = re.compile(r"^(\*\*|#)")
+# Stored per doc; a doc whose chunker changed is re-chunked on the next sync.
+# "nt": digest chunks are embedded without the issue title, which names the
+# lead story and pulled that item's cosine from 0.57 to 0.36.
+CHUNKER_STD = f"w{CHUNK_WORDS}o{OVERLAP_WORDS}"
+CHUNKER_DIGEST = f"digest{DIGEST_WORDS}m{DIGEST_MIN_WORDS}nt"
 
 FRONTMATTER_RE = re.compile(r"^---\n(.*?)\n---\n", re.S)
 DATE_PREFIX_RE = re.compile(r"^(\d{4}-\d{2}-\d{2})")
@@ -78,32 +91,37 @@ def parse_doc(path: Path) -> tuple[dict, list[str], int]:
     return fm, text.splitlines(), first_line
 
 
-def chunk_lines(lines: list[str], first_line: int) -> list[tuple[int, int, str]]:
+def chunk_lines(lines: list[str], first_line: int, digest: bool = False) -> list[tuple[int, int, str]]:
     """[(start_line, end_line, text)] of ~CHUNK_WORDS words, overlapping.
 
     Lines are kept whole where possible so a chunk can be cited by line range
     (the forward-trends verifier cites 'file line N'). A single line longer
     than the budget (transcript turns run past 12k chars) is split by words
     and every piece carries that line's number.
+
+    digest=True: DIGEST_WORDS chunks with no overlap, and a new chunk starts
+    at each item boundary (a line opening with ** or #) once the current one
+    holds DIGEST_MIN_WORDS.
     """
-    units: list[tuple[int, list[str]]] = []
+    budget, overlap = (DIGEST_WORDS, 0) if digest else (CHUNK_WORDS, OVERLAP_WORDS)
+    units: list[tuple[int, list[str], bool]] = []
     for i, line in enumerate(lines):
         words = line.split()
         if not words:
             continue
         ln = first_line + i
-        for j in range(0, len(words), CHUNK_WORDS):
-            units.append((ln, words[j:j + CHUNK_WORDS]))
+        for j in range(0, len(words), budget):
+            units.append((ln, words[j:j + budget], j == 0 and digest and bool(ITEM_START_RE.match(line))))
     chunks = []
-    cur: list[tuple[int, list[str]]] = []
+    cur: list[tuple[int, list[str], bool]] = []
     n = 0
     for u in units:
-        if cur and n + len(u[1]) > CHUNK_WORDS:
+        if cur and (n + len(u[1]) > budget or (u[2] and n >= DIGEST_MIN_WORDS)):
             chunks.append(cur)
-            # carry trailing units up to OVERLAP_WORDS into the next chunk
+            # carry trailing units up to overlap words into the next chunk
             keep, kn = [], 0
             for v in reversed(cur):
-                if kn + len(v[1]) > OVERLAP_WORDS:
+                if kn + len(v[1]) > overlap:
                     break
                 keep.insert(0, v)
                 kn += len(v[1])
@@ -112,7 +130,7 @@ def chunk_lines(lines: list[str], first_line: int) -> list[tuple[int, int, str]]
         n += len(u[1])
     if cur:
         chunks.append(cur)
-    return [(c[0][0], c[-1][0], " ".join(w for _, ws in c for w in ws)) for c in chunks]
+    return [(c[0][0], c[-1][0], " ".join(w for _, ws, _ in c for w in ws)) for c in chunks]
 
 
 def open_db() -> sqlite3.Connection:
@@ -131,6 +149,10 @@ def open_db() -> sqlite3.Connection:
             text, content='chunks', content_rowid='id', tokenize='unicode61');
         CREATE TABLE IF NOT EXISTS vec(chunk_id INTEGER PRIMARY KEY, v BLOB);
     """)
+    if "chunker" not in [r[1] for r in db.execute("PRAGMA table_info(docs)")]:
+        # Docs indexed before the column existed were all chunked the standard way.
+        db.execute(f"ALTER TABLE docs ADD COLUMN chunker TEXT DEFAULT '{CHUNKER_STD}'")
+        db.commit()
     return db
 
 
@@ -147,14 +169,16 @@ def sync_docs(db: sqlite3.Connection) -> int:
     """Add/replace changed docs and their chunks; drop vanished ones. Returns docs touched."""
     files = corpus_files()
     seen = set()
-    known = {p: (i, s, m) for i, p, s, m in db.execute("SELECT id, path, size, mtime FROM docs")}
+    known = {p: (i, s, m, ch) for i, p, s, m, ch in db.execute("SELECT id, path, size, mtime, chunker FROM docs")}
     touched = 0
     for corpus, source, path in files:
         rel = str(path.relative_to(ROOT))
         seen.add(rel)
         st = path.stat()
+        digest = source in DIGEST_SOURCES
+        chunker = CHUNKER_DIGEST if digest else CHUNKER_STD
         k = known.get(rel)
-        if k and k[1] == st.st_size and abs(k[2] - st.st_mtime) < 1e-6:
+        if k and k[1] == st.st_size and abs(k[2] - st.st_mtime) < 1e-6 and k[3] == chunker:
             continue
         if k:
             drop_doc(db, k[0])
@@ -162,11 +186,11 @@ def sync_docs(db: sqlite3.Connection) -> int:
         dm = DATE_PREFIX_RE.match(path.name) or DATE_PREFIX_RE.match(path.stem.replace("the-week-in-ai-", ""))
         date = dm.group(1) if dm else (fm.get("published") or fm.get("date") or "")[:10]
         cur = db.execute(
-            "INSERT INTO docs(path, corpus, source, date, title, url, size, mtime) VALUES(?,?,?,?,?,?,?,?)",
+            "INSERT INTO docs(path, corpus, source, date, title, url, size, mtime, chunker) VALUES(?,?,?,?,?,?,?,?,?)",
             (rel, corpus, source, date, fm.get("title", path.stem), fm.get("url") or fm.get("link", ""),
-             st.st_size, st.st_mtime))
+             st.st_size, st.st_mtime, chunker))
         doc_id = cur.lastrowid
-        for o, (a, b, text) in enumerate(chunk_lines(lines, first)):
+        for o, (a, b, text) in enumerate(chunk_lines(lines, first, digest)):
             c = db.execute("INSERT INTO chunks(doc_id, ord, start_line, end_line, text) VALUES(?,?,?,?,?)",
                            (doc_id, o, a, b, text))
             db.execute("INSERT INTO chunks_fts(rowid, text) VALUES(?, ?)", (c.lastrowid, text))
@@ -174,7 +198,7 @@ def sync_docs(db: sqlite3.Connection) -> int:
         if touched % 500 == 0:
             db.commit()
             print(f"  chunked {touched} docs…", flush=True)
-    for rel, (doc_id, _, _) in known.items():
+    for rel, (doc_id, _, _, _) in known.items():
         if rel not in seen:
             drop_doc(db, doc_id)
             touched += 1
@@ -194,10 +218,12 @@ def embed_missing(db: sqlite3.Connection, since: str = "", until: str = "", batc
     if since or until:
         rng = "AND (d.corpus='briefs' OR (d.date >= ? AND d.date <= ?))"
         args = [since or "0000", until or "9999"]
-    todo = db.execute(f"""SELECT c.id, d.title, c.text FROM chunks c JOIN docs d ON d.id=c.doc_id
+    todo = db.execute(f"""SELECT c.id, CASE WHEN d.source IN ({','.join('?' * len(DIGEST_SOURCES))})
+                                             THEN '' ELSE d.title END, c.text
+                          FROM chunks c JOIN docs d ON d.id=c.doc_id
                           LEFT JOIN vec v ON v.chunk_id=c.id
                           WHERE v.chunk_id IS NULL {rng}
-                          ORDER BY c.id""", args).fetchall()
+                          ORDER BY c.id""", [*sorted(DIGEST_SOURCES), *args]).fetchall()
     if not todo:
         return 0
     print(f"  embedding {len(todo)} chunks with {MODEL}…", flush=True)
@@ -208,8 +234,8 @@ def embed_missing(db: sqlite3.Connection, since: str = "", until: str = "", batc
     for i in range(0, len(todo), batch):
         part = todo[i:i + batch]
         # Title prefix gives a passage its document context ("Muse Spark 1.3" in a
-        # chunk that only says "the model").
-        texts = [f"{title}\n{text}" for _, title, text in part]
+        # chunk that only says "the model"). Digest chunks come with title ''.
+        texts = [f"{title}\n{text}" if title else text for _, title, text in part]
         emb = model.encode(texts, batch_size=32, normalize_embeddings=True).astype(np.float16)
         db.executemany("INSERT OR REPLACE INTO vec(chunk_id, v) VALUES(?, ?)",
                        [(cid, e.tobytes()) for (cid, _, _), e in zip(part, emb)])

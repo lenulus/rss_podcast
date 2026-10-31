@@ -42,6 +42,11 @@ POOL = 200          # candidates taken from each ranker before fusion
 # 13/16 at 1.0, 14/16 at 0.5; at 0.3 the exact-figure case, "108x" vs "108×",
 # dropped out). Tuned on 16 items, so a default, not an optimum.
 KW_WEIGHT = 0.5
+# Fusion rewards documents both rankers find, so a BM25 #1 that the vectors
+# miss (an exact name or figure buried in a digest) could drop out of hybrid
+# results entirely. The top KW_PIN keyword documents always stay in, taking
+# the last slots if they didn't place on their own.
+KW_PIN = 3
 
 
 class BlindPhaseError(RuntimeError):
@@ -177,17 +182,33 @@ def search(q: str, *, corpora=("raw",), since=None, until=None, sources=(), mode
         f"""SELECT c.id, d.path, d.date, d.source, d.title, d.url, c.start_line, c.end_line, c.text
             FROM chunks c JOIN docs d ON d.id=c.doc_id WHERE c.id IN ({','.join('?' * len(order))})""",
         order)}
+    def entry(cid):
+        r = rows[cid]
+        return {"path": r[1], "date": r[2], "source": r[3], "title": r[4], "url": r[5],
+                "lines": f"{r[6]}-{r[7]}", "score": round(score[cid], 5),
+                "via": "+".join(sorted(via[cid])), "text": r[8]}
+
     out, per = [], {}
     for cid in order:
         r = rows[cid]
         if per.get(r[1], 0) >= per_doc:
             continue
         per[r[1]] = per.get(r[1], 0) + 1
-        out.append({"path": r[1], "date": r[2], "source": r[3], "title": r[4], "url": r[5],
-                    "lines": f"{r[6]}-{r[7]}", "score": round(score[cid], 5),
-                    "via": "+".join(sorted(via[cid])), "text": r[8]})
+        out.append(entry(cid))
         if len(out) >= k:
             break
+    if mode == "hybrid":
+        pins, pin_paths = [], set()
+        for cid in ranked["keyword"]:
+            if rows[cid][1] not in pin_paths:
+                pin_paths.add(rows[cid][1])
+                pins.append(cid)
+            if len(pins) >= KW_PIN:
+                break
+        placed = {o["path"] for o in out}
+        missing = [cid for cid in pins if rows[cid][1] not in placed]
+        if missing:
+            out = out[:max(0, k - len(missing))] + [entry(cid) for cid in missing]
     if sort == "date":
         out.sort(key=lambda x: x["date"])
     return out
