@@ -28,3 +28,7 @@ __pycache__/
 
 # Logs
 *.log
+
+# Local search index (build_index.py / search.py)
+.venv-search/
+search_index/
